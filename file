@@ -1,0 +1,991 @@
+package com.ing.datadist.domain;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDateTime;
+
+/**
+ * Domain class for File Ingestion tracking
+ */
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class FileIngestionDomain {
+
+    private String fileId;
+    private String batchId;
+    private String fileName;
+    private String filePath;
+    private Long fileSize;
+    private String fileChecksum;
+    private String flowName;
+    private String flowType;
+    private String frequency;
+    private String sourceSystem;
+    private String status;
+    private LocalDateTime receivedTs;
+    private LocalDateTime processingStartTs;
+    private LocalDateTime processingEndTs;
+    private Long totalRecords;
+    private Long processedRecords;
+    private Long failedRecords;
+    private Long skippedRecords;
+    private String errorMessage;
+    private Integer retryCount;
+    private String createdBy;
+    private LocalDateTime createdTs;
+    private String updatedBy;
+    private LocalDateTime updatedTs;
+}
+package com.ing.datadist.dao;
+
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.List;
+
+import com.ing.datadist.enums.FileIngestionStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+
+import com.ing.datadist.domain.FileIngestionDomain;
+
+/**
+ * FileIngestionDAO - Data access object for file ingestion tracking
+ * Handles all database operations for DD_FILE_INGESTION_TBL
+ */
+@Repository
+public class FileIngestionDAO {
+
+    private static final Logger log = LoggerFactory.getLogger(FileIngestionDAO.class);
+
+    private final JdbcTemplate jdbcTemplate;
+
+    public FileIngestionDAO(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    /**
+     * Insert a new file ingestion record
+     */
+    public void insertFileIngestion(FileIngestionDomain domain) {
+        String sql = "INSERT INTO DD_FILE_INGESTION_TBL (" +
+                "FILE_ID, BATCH_ID, FILE_NAME, FILE_PATH, FILE_SIZE, FILE_CHECKSUM, " +
+                "FLOW_NAME, FLOW_TYPE, FREQUENCY, SOURCE_SYSTEM, STATUS, RECEIVED_TS, " +
+                "CREATED_BY, CREATED_TS, UPDATED_BY, UPDATED_TS) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSTIMESTAMP, ?, SYSTIMESTAMP, ?, SYSTIMESTAMP)";
+
+        try {
+            jdbcTemplate.update(sql,
+                    domain.getFileId(),
+                    domain.getBatchId(),
+                    domain.getFileName(),
+                    domain.getFilePath(),
+                    domain.getFileSize(),
+                    domain.getFileChecksum(),
+                    domain.getFlowName(),
+                    domain.getFlowType(),
+                    domain.getFrequency(),
+                    domain.getSourceSystem(),
+                    domain.getStatus(),
+                    domain.getCreatedBy(),
+                    domain.getUpdatedBy());
+
+            log.info("File Ingestion registered for FILE_ID: {}, FILE_NAME: {}",
+                    domain.getFileId(), domain.getFileName());
+        } catch (Exception e) {
+            log.error("Error inserting file ingestion record for FILE_ID: {}",
+                    domain.getFileId(), e);
+            throw e;
+        }
+    }
+
+    /**
+     * Update file ingestion status and metrics
+     */
+
+    public void updateFileIngestionStatus(String fileId, String status,
+                                          Integer totalRecords,
+                                          Integer processedRecords,
+                                          Integer failedRecords,
+                                          String errorMessage) {
+
+        String sql =
+                "UPDATE DD_FILE_INGESTION_TBL " +
+                        "SET STATUS = ?, " +
+                        "    TOTAL_RECORDS = NVL(?, TOTAL_RECORDS), " +
+                        "    PROCESSED_RECORDS = NVL(?, PROCESSED_RECORDS), " +
+                        "    FAILED_RECORDS = NVL(?, FAILED_RECORDS), " +
+                        "    ERROR_MESSAGE = ?, " +
+                        "    UPDATED_BY = 'DD_SYSTEM', UPDATED_TS = SYSTIMESTAMP " +
+                        "WHERE FILE_ID = ?";
+
+        jdbcTemplate.update(sql,
+                status,
+                totalRecords,
+                processedRecords,
+                failedRecords,
+                errorMessage,
+                fileId);
+    }    /**
+     * Update file processing end timestamp and final metrics
+     */
+    public void updateFileProcessingEnd(String fileId, Long fileSize, String fileChecksum,
+                                        Long totalRecords, Long processedRecords, Long failedRecords) {
+
+        String status = (failedRecords != null && failedRecords > 0)
+                ? FileIngestionStatus.PARTIALLY_COMPLETED.getValue()
+                : FileIngestionStatus.COMPLETED.getValue();
+
+        String sql = "UPDATE DD_FILE_INGESTION_TBL " +
+                "SET PROCESSING_END_TS = SYSTIMESTAMP, " +
+                "    FILE_SIZE = NVL(?, FILE_SIZE), " +
+                "    TOTAL_RECORDS = NVL(?, TOTAL_RECORDS), " +
+                "    PROCESSED_RECORDS = NVL(?, PROCESSED_RECORDS), " +
+                "    FAILED_RECORDS = NVL(?, FAILED_RECORDS), " +
+                "    STATUS = ?, " +
+                "    UPDATED_BY = 'DD_SYSTEM', UPDATED_TS = SYSTIMESTAMP " +
+                "WHERE FILE_ID = ?";
+
+        jdbcTemplate.update(sql,
+                fileSize,
+                totalRecords != null ? totalRecords.intValue() : null,
+                processedRecords != null ? processedRecords.intValue() : null,
+                failedRecords != null ? failedRecords.intValue() : null,
+                status,
+                fileId);
+    }
+    /**
+     * Update file processing metrics during processing
+     */
+    public void updateFileMetrics(String fileId, Long processedRecords, Long failedRecords, Long skippedRecords) {
+        String sql = "UPDATE DD_FILE_INGESTION_TBL " +
+                "SET PROCESSED_RECORDS = NVL(?, PROCESSED_RECORDS), " +
+                "    FAILED_RECORDS = NVL(?, FAILED_RECORDS), " +
+                "    SKIPPED_RECORDS = NVL(?, SKIPPED_RECORDS), " +
+                "    UPDATED_BY = 'DD_SYSTEM', UPDATED_TS = SYSTIMESTAMP " +
+                "WHERE FILE_ID = ?";
+
+        jdbcTemplate.update(sql,
+                processedRecords != null ? processedRecords.intValue() : null,
+                failedRecords != null ? failedRecords.intValue() : null,
+                skippedRecords != null ? skippedRecords.intValue() : null,
+                fileId);
+    }
+    /**
+     * Mark file processing as started
+     */
+    public void updateProcessingStart(String fileId, String batchId) {
+        String sql = "UPDATE DD_FILE_INGESTION_TBL " +
+                "SET STATUS = 'IN_PROGRESS', PROCESSING_START_TS = SYSTIMESTAMP, " +
+                "BATCH_ID = ?, UPDATED_BY = 'DD_SYSTEM', UPDATED_TS = SYSTIMESTAMP " +
+                "WHERE FILE_ID = ?";
+
+        try {
+            jdbcTemplate.update(sql, batchId, fileId);
+            log.info("File Ingestion processing started for FILE_ID: {}", fileId);
+        } catch (Exception e) {
+            log.error("Error updating processing start for FILE_ID: {}", fileId, e);
+            throw e;
+        }
+    }
+
+    /**
+     * Retrieve file ingestion record by file ID
+     */
+    public FileIngestionDomain getFileIngestionByFileId(String fileId) {
+        String sql = "SELECT * FROM DD_FILE_INGESTION_TBL WHERE FILE_ID = ?";
+
+        try {
+            List<FileIngestionDomain> results = jdbcTemplate.query(sql,
+                    new FileIngestionRowMapper(), fileId);
+
+            if (results.isEmpty()) {
+                log.warn("No file ingestion record found for FILE_ID: {}", fileId);
+                return null;
+            }
+            return results.getFirst();
+        } catch (Exception e) {
+            log.error("Error retrieving file ingestion for FILE_ID: {}", fileId, e);
+            throw e;
+        }
+    }
+
+    /**
+     * Get files by status
+     */
+    public List<FileIngestionDomain> getFilesByStatus(String status) {
+        String sql = "SELECT * FROM DD_FILE_INGESTION_TBL WHERE STATUS = ? ORDER BY RECEIVED_TS ASC";
+
+        try {
+            return jdbcTemplate.query(sql, new FileIngestionRowMapper(), status);
+        } catch (Exception e) {
+            log.error("Error retrieving files by status: {}", status, e);
+            throw e;
+        }
+    }
+
+    /**
+     * Row mapper for FileIngestionDomain
+     */
+    private static class FileIngestionRowMapper implements RowMapper<FileIngestionDomain> {
+        @Override
+        public FileIngestionDomain mapRow(ResultSet rs, int rowNum) throws SQLException {
+            FileIngestionDomain domain = new FileIngestionDomain();
+            domain.setFileId(rs.getString("FILE_ID"));
+            domain.setBatchId(rs.getString("BATCH_ID"));
+            domain.setFileName(rs.getString("FILE_NAME"));
+            domain.setFilePath(rs.getString("FILE_PATH"));
+            domain.setFileSize(rs.getLong("FILE_SIZE"));
+            domain.setFileChecksum(rs.getString("FILE_CHECKSUM"));
+            domain.setFlowName(rs.getString("FLOW_NAME"));
+            domain.setFlowType(rs.getString("FLOW_TYPE"));
+            domain.setFrequency(rs.getString("FREQUENCY"));
+            domain.setSourceSystem(rs.getString("SOURCE_SYSTEM"));
+            domain.setStatus(rs.getString("STATUS"));
+
+            // Convert sql.Timestamp to LocalDateTime
+            java.sql.Timestamp receivedTs = rs.getTimestamp("RECEIVED_TS");
+            if (receivedTs != null) {
+                domain.setReceivedTs(receivedTs.toLocalDateTime());
+            }
+
+            java.sql.Timestamp processingStartTs = rs.getTimestamp("PROCESSING_START_TS");
+            if (processingStartTs != null) {
+                domain.setProcessingStartTs(processingStartTs.toLocalDateTime());
+            }
+
+            java.sql.Timestamp processingEndTs = rs.getTimestamp("PROCESSING_END_TS");
+            if (processingEndTs != null) {
+                domain.setProcessingEndTs(processingEndTs.toLocalDateTime());
+            }
+
+            // Convert Integer to Long for record counts
+            Integer totalRecords = rs.getObject("TOTAL_RECORDS", Integer.class);
+            if (totalRecords != null) {
+                domain.setTotalRecords(totalRecords.longValue());
+            }
+
+            Integer processedRecords = rs.getObject("PROCESSED_RECORDS", Integer.class);
+            if (processedRecords != null) {
+                domain.setProcessedRecords(processedRecords.longValue());
+            }
+
+            Integer failedRecords = rs.getObject("FAILED_RECORDS", Integer.class);
+            if (failedRecords != null) {
+                domain.setFailedRecords(failedRecords.longValue());
+            }
+
+            Integer skippedRecords = rs.getObject("SKIPPED_RECORDS", Integer.class);
+            if (skippedRecords != null) {
+                domain.setSkippedRecords(skippedRecords.longValue());
+            }
+
+            domain.setErrorMessage(rs.getString("ERROR_MESSAGE"));
+            domain.setRetryCount(rs.getObject("RETRY_COUNT", Integer.class));
+            domain.setCreatedBy(rs.getString("CREATED_BY"));
+
+            java.sql.Timestamp createdTs = rs.getTimestamp("CREATED_TS");
+            if (createdTs != null) {
+                domain.setCreatedTs(createdTs.toLocalDateTime());
+            }
+
+            domain.setUpdatedBy(rs.getString("UPDATED_BY"));
+
+            java.sql.Timestamp updatedTs = rs.getTimestamp("UPDATED_TS");
+            if (updatedTs != null) {
+                domain.setUpdatedTs(updatedTs.toLocalDateTime());
+            }
+
+            return domain;
+        }
+    }
+
+    public void updateTotalNumberOfRecords(String fileId, Long totalRecords, Long fileSize) {
+        String sql = "UPDATE DD_FILE_INGESTION_TBL " +
+                "SET TOTAL_RECORDS = ?,FILE_SIZE = ? " +
+                "WHERE FILE_ID = ?";
+
+        try {
+            jdbcTemplate.update(sql, totalRecords, fileSize, fileId);
+            log.info("File Ingestion totalRecords updated for FILE_ID: {}, totalRecords: {}, fileSize:{}", fileId, totalRecords, fileSize);
+        } catch (Exception e) {
+            log.error("Error updating file ingestion totalRecords for FILE_ID: {}", fileId, e);
+            throw e;
+        }
+    }
+}
+package com.ing.datadist.dao;
+
+import com.ing.datadist.enums.ErrorType;
+import com.ing.datadist.enums.RecordType;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+@Repository
+@Slf4j
+public class ErrorLogDAO {
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    /**
+     * Log API error to DD_ERROR_LOG table
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logApiError(RecordType recordType, String externalIdentifier, String ddUuid,
+                            String errorCode, String errorMessage, String apiEndpoint,
+                            String requestPayload, String responsePayload, String batchId, String fileName, String fileId) {
+        try {
+            log.info("Data_Distributor_Error_Log: Logging error - RecordType:{}, ExternalIdentifier:{}, ErrorType:{}, ErrorCode:{}, FileId:{}",
+                    recordType.getCode(), externalIdentifier, ErrorType.API_ERROR.getCode(), errorCode, fileId);
+
+            String sql = "INSERT INTO DD_ERROR_LOG (RECORD_TYPE, External_IDENTIFIER, DD_UUID, " +
+                    "ERROR_CODE, ERROR_TYPE, ERROR_MESSAGE, API_ENDPOINT, REQUEST_PAYLOAD, RESPONSE_PAYLOAD, " +
+                    "BATCH_ID, FILE_NAME, FILE_ID) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+            jdbcTemplate.update(sql,
+                    recordType.getCode(),
+                    externalIdentifier,
+                    ddUuid,
+                    errorCode,
+                    ErrorType.API_ERROR.getCode(),
+                    errorMessage,
+                    apiEndpoint,
+                    requestPayload,
+                    responsePayload,
+                    batchId,
+                    fileName,
+                    fileId);
+
+            log.info("Data_Distributor_Error_Log: Error logged successfully for ExternalIdentifier:{}, FileId:{}", externalIdentifier, fileId);
+        } catch (Exception e) {
+            log.error("Data_Distributor_Error_Log: Failed to log error for ExternalIdentifier:{}, FileId:{}", externalIdentifier, fileId, e);
+        }
+    }
+
+    /**
+     * Log parsing error to DD_ERROR_LOG table
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logParsingError(RecordType recordType, String fileName, String errorMessage,
+                                String batchId, String stackTrace, String fileId) {
+        try {
+            log.info("Data_Distributor_Error_Log: Logging parsing error - RecordType:{}, FileName:{}, ErrorMsg:{}, FileId:{}",
+                    recordType.getCode(), fileName, errorMessage, fileId);
+
+            String sql = "INSERT INTO DD_ERROR_LOG (RECORD_TYPE, FILE_NAME, ERROR_TYPE, " +
+                    "ERROR_MESSAGE, STACK_TRACE, BATCH_ID, FILE_ID) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)";
+
+            jdbcTemplate.update(sql,
+                    recordType.getCode(),
+                    fileName,
+                    ErrorType.PARSING_ERROR.getCode(),
+                    errorMessage,
+                    stackTrace,
+                    batchId,
+                    fileId);
+
+            log.info("Data_Distributor_Error_Log: Parsing error logged successfully for file:{}, FileId:{}",
+                    fileName, fileId);
+        } catch (Exception e) {
+            log.error("Data_Distributor_Error_Log: Failed to log parsing error for file:{}, FileId:{}", fileName, fileId, e);
+        }
+    }
+
+    /**
+     * Log validation error to DD_ERROR_LOG table
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logValidationError(RecordType recordType, String externalIdentifier, String errorMessage,
+                                   String batchId, String fileName, String fileId) {
+        try {
+            log.info("Data_Distributor_Error_Log: Logging validation error - RecordType:{}, ExternalIdentifier:{}, ErrorMsg:{}, FileId:{}",
+                    recordType.getCode(), externalIdentifier, errorMessage, fileId);
+
+            String sql = "INSERT INTO DD_ERROR_LOG (RECORD_TYPE, External_IDENTIFIER, ERROR_TYPE, ERROR_MESSAGE, " +
+                    "BATCH_ID, FILE_NAME, FILE_ID) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)";
+
+            jdbcTemplate.update(sql,
+                    recordType.getCode(),
+                    externalIdentifier,
+                    ErrorType.VALIDATION_ERROR.getCode(),
+                    errorMessage,
+                    batchId,
+                    fileName,
+                    fileId);
+
+            log.info("Data_Distributor_Error_Log: Validation error logged successfully for ExternalIdentifier:{}, FileId:{}", externalIdentifier, fileId);
+        } catch (Exception e) {
+            log.error("Data_Distributor_Error_Log: Failed to log validation error for ExternalIdentifier:{}, FileId:{}", externalIdentifier, fileId, e);
+        }
+    }
+
+    /**
+     * Log database error to DD_ERROR_LOG table
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logDatabaseError(RecordType recordType, String externalIdentifier, String ddUuid, String errorMessage,
+                                 String batchId, String fileName, String stackTrace, String fileId) {
+        try {
+            log.info("Data_Distributor_Error_Log: Logging database error - RecordType:{}, ExternalIdentifier:{}, ErrorMsg:{}, FileId:{}",
+                    recordType.getCode(), externalIdentifier, errorMessage, fileId);
+
+            String sql = "INSERT INTO DD_ERROR_LOG (RECORD_TYPE, External_IDENTIFIER, DD_UUID, ERROR_TYPE, " +
+                    "ERROR_MESSAGE, STACK_TRACE, BATCH_ID, FILE_NAME, FILE_ID) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+            jdbcTemplate.update(sql,
+                    recordType.getCode(),
+                    externalIdentifier,
+                    ddUuid,
+                    ErrorType.DATABASE_ERROR.getCode(),
+                    errorMessage,
+                    stackTrace,
+                    batchId,
+                    fileName,
+                    fileId);
+
+            log.info("Data_Distributor_Error_Log: Database error logged successfully for ExternalIdentifier:{}, FileId:{}", externalIdentifier, fileId);
+        } catch (Exception e) {
+            log.error("Data_Distributor_Error_Log: Failed to log database error for ExternalIdentifier:{}, FileId:{}", externalIdentifier, fileId, e);
+        }
+    }
+
+    /**
+     * Log generic error with full details to DD_ERROR_LOG table
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logError(RecordType recordType, String externalIdentifier, String ddUuid,
+                         ErrorType errorType, String errorMessage, String batchId, String fileName, String stackTrace, String fileId) {
+        try {
+            log.info("Data_Distributor_Error_Log: Logging {} error - RecordType:{}, ExternalIdentifier:{}, FileId:{}",
+                    errorType.getCode(), recordType.getCode(), externalIdentifier, fileId);
+
+            String sql = "INSERT INTO DD_ERROR_LOG (RECORD_TYPE, External_IDENTIFIER, DD_UUID, " +
+                    "ERROR_TYPE, ERROR_MESSAGE, STACK_TRACE, BATCH_ID, FILE_NAME, FILE_ID) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+            jdbcTemplate.update(sql,
+                    recordType.getCode(),
+                    externalIdentifier,
+                    ddUuid,
+                    errorType.getCode(),
+                    errorMessage,
+                    stackTrace,
+                    batchId,
+                    fileName,
+                    fileId);
+
+            log.info("Data_Distributor_Error_Log: Error logged successfully for ExternalIdentifier:{}, FileId:{}", externalIdentifier, fileId);
+        } catch (Exception e) {
+            log.error("Data_Distributor_Error_Log: Failed to log error for ExternalIdentifier:{}, FileId:{}", externalIdentifier, fileId, e);
+        }
+    }
+
+    /**
+     * Log OnePAM validation error - Organisation/Organisation Unit not found
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logOnePamValidationError(RecordType recordType, String externalIdentifier, String ddUuid,
+                                         String errorMessage, String batchId, String fileName, String fileId) {
+        try {
+            log.info("Data_Distributor_Error_Log: Logging OnePAM validation error - RecordType:{}, ExternalIdentifier:{}, DDUuid:{}, ErrorMsg:{}, FileId:{}",
+                    recordType.getCode(), externalIdentifier, ddUuid, errorMessage, fileId);
+
+            String sql = "INSERT INTO DD_ERROR_LOG (RECORD_TYPE, External_IDENTIFIER, DD_UUID, ERROR_TYPE, " +
+                    "ERROR_MESSAGE, BATCH_ID, FILE_NAME, FILE_ID, CREATED_BY, CREATED_TS) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, SYSTIMESTAMP)";
+
+            jdbcTemplate.update(sql,
+                    recordType.getCode(),
+                    externalIdentifier,
+                    ddUuid,
+                    ErrorType.VALIDATION_ERROR.getCode(),
+                    errorMessage,
+                    batchId,
+                    fileName,
+                    fileId,
+                    "DD_USER");
+
+            log.info("Data_Distributor_Error_Log: OnePAM validation error logged successfully for ExternalIdentifier:{}, FileId:{}", externalIdentifier, fileId);
+        } catch (Exception e) {
+            log.error("Data_Distributor_Error_Log: Failed to log OnePAM validation error for ExternalIdentifier:{}, FileId:{}", externalIdentifier, fileId, e);
+        }
+    }
+}package com.ing.datadist.dao;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Repository;
+
+
+@Repository
+public class ApiTransactionLogDAO {
+
+    private static final Logger logger = LoggerFactory.getLogger(ApiTransactionLogDAO.class);
+
+    public static final String STATUS_SUCCESS = "SUCCESS";
+    public static final String STATUS_FAILED = "FAILED";
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+
+    public void logApiTransaction(
+            String ddUuid,
+            String fileId,
+            String flowName,
+            String apiEndpoint,
+            String apiMethod,
+            String requestPayload,
+            Integer responseStatusCode,
+            String responsePayload,
+            String errorCode,
+            String errorMessage) {
+
+        String sql = "INSERT INTO DD_API_STATUS_TBL (" +
+                "DD_UUID, FILE_ID, FLOW_NAME, API_ENDPOINT, API_METHOD, " +
+                "STATUS, REQUEST_PAYLOAD, RESPONSE_STATUS_CODE, RESPONSE_PAYLOAD, " +
+                "ERROR_CODE, ERROR_MESSAGE, RETRY_COUNT, CREATED_BY, CREATED_TS) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'DD_USER', SYSTIMESTAMP)";
+
+        try {
+            String status = (responseStatusCode != null && responseStatusCode >= 200 && responseStatusCode < 300)
+                    ? STATUS_SUCCESS
+                    : STATUS_FAILED;
+
+            jdbcTemplate.update(sql, ps -> {
+                ps.setString(1, ddUuid);
+                ps.setString(2, fileId);
+                ps.setString(3, flowName);
+                ps.setString(4, apiEndpoint);
+                ps.setString(5, apiMethod);
+                ps.setString(6, status);
+                ps.setString(7, requestPayload);
+                ps.setObject(8, responseStatusCode);
+                ps.setString(9, responsePayload);
+                ps.setString(10, errorCode);
+                ps.setString(11, errorMessage);
+            });
+
+            logger.info(
+                    "DD_API_STATUS Logged Flow={}, Endpoint={}, Status={}, Code={}, DD_UUID={}, FileId={}",
+                    flowName, apiEndpoint, status, responseStatusCode, ddUuid, fileId
+            );
+
+        } catch (Exception e) {
+            logger.error("Error logging API transaction for endpoint {}: {}", apiEndpoint, e.getMessage(), e);
+        }
+    }
+
+
+    public void logApiSuccess(
+            String ddUuid,
+            String fileId,
+            String flowName,
+            String apiEndpoint,
+            String apiMethod,
+            Integer responseStatusCode) {
+
+        logApiTransaction(ddUuid, fileId, flowName,
+                apiEndpoint, apiMethod,
+                null, responseStatusCode, null, null, null);
+    }
+
+
+    public void logApiSuccess(
+            String ddUuid,
+            String fileId,
+            String flowName,
+            String apiEndpoint,
+            String apiMethod,
+            String requestPayload,
+            Integer responseStatusCode,
+            String responsePayload) {
+
+        logApiTransaction(ddUuid, fileId, flowName,
+                apiEndpoint, apiMethod,
+                requestPayload, responseStatusCode, responsePayload,
+                null, null);
+    }
+
+
+
+    public void logApiFailure(
+            String ddUuid,
+            String fileId,
+            String flowName,
+            String apiEndpoint,
+            String apiMethod,
+            String errorCode,
+            String errorMessage) {
+
+        logApiTransaction(ddUuid, fileId, flowName,
+                apiEndpoint, apiMethod,
+                null, null, null,
+                errorCode, errorMessage);
+    }
+
+
+
+    public void logApiFailure(
+            String ddUuid,
+            String fileId,
+            String flowName,
+            String apiEndpoint,
+            String apiMethod,
+            String requestPayload,
+            Integer responseStatusCode,
+            String responsePayload,
+            String errorCode,
+            String errorMessage) {
+
+        logApiTransaction(ddUuid, fileId, flowName,
+                apiEndpoint, apiMethod,
+                requestPayload, responseStatusCode, responsePayload,
+                errorCode, errorMessage);
+    }
+
+    public void updateNotificationStatusByUuid(String ddUuid, String fileId) {
+
+        String sql =
+                "MERGE INTO DD_NOTIFICATION_STATUS dst " +
+                        "USING (SELECT ? AS DD_UUID, ? AS FILE_ID FROM dual) src " +
+                        "ON (dst.DD_UUID = src.DD_UUID AND dst.FILE_ID = src.FILE_ID) " +
+
+                        "WHEN MATCHED THEN " +
+                        "    UPDATE SET " +
+                        "        dst.STATUS = (CASE WHEN EXISTS ( " +
+                        "            SELECT 1 FROM DD_API_STATUS_TBL ap " +
+                        "            WHERE ap.DD_UUID = src.DD_UUID " +
+                        "              AND ap.FILE_ID = src.FILE_ID " +
+                        "              AND ap.RESPONSE_STATUS_CODE >= 400 " +
+                        "        ) THEN 'FAILED' ELSE 'SUCCESS' END), " +
+                        "        dst.UPDATED_TS = SYSTIMESTAMP, " +
+                        "        dst.UPDATED_BY = 'DD_USER' " +
+
+                        "WHEN NOT MATCHED THEN " +
+                        "    INSERT (DD_UUID, FILE_ID, STATUS, CREATED_TS, CREATED_BY) " +
+                        "    VALUES ( " +
+                        "        src.DD_UUID, " +
+                        "        src.FILE_ID, " +
+                        "        (CASE WHEN EXISTS ( " +
+                        "            SELECT 1 FROM DD_API_STATUS_TBL ap " +
+                        "            WHERE ap.DD_UUID = src.DD_UUID " +
+                        "              AND ap.FILE_ID = src.FILE_ID " +
+                        "              AND ap.RESPONSE_STATUS_CODE >= 400 " +
+                        "        ) THEN 'FAILED' ELSE 'SUCCESS' END), " +
+                        "        SYSTIMESTAMP, " +
+                        "        'DD_USER' " +
+                        "    )";
+
+        try {
+            int result = jdbcTemplate.update(sql, ddUuid, fileId);
+            logger.info("MERGE completed for DD_UUID={}, FILE_ID={}, rows={}", ddUuid, fileId, result);
+        } catch (Exception e) {
+            logger.error("Error MERGING notification status for DD_UUID={}, FILE_ID={}: {}",
+                    ddUuid, fileId, e.getMessage(), e);
+        }
+    }
+
+    public String fetchNotificationStatus(String ddUuid, String fileId) {
+        String sql = "SELECT STATUS FROM DD_NOTIFICATION_STATUS WHERE DD_UUID = ? AND FILE_ID = ?";
+        try {
+            return jdbcTemplate.queryForObject(sql, new Object[]{ddUuid, fileId}, String.class);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    public void bulkUpdateNotificationStatusByUuids(java.util.List<String> ddUuids, String fileId) {
+
+        if (ddUuids == null || ddUuids.isEmpty()) {
+            logger.warn("Bulk update skipped: no UUIDs");
+            return;
+        }
+
+        String placeholders = String.join(",", ddUuids.stream().map(u -> "?").toArray(String[]::new));
+
+        String sql = "UPDATE DD_NOTIFICATION_STATUS SET STATUS = " +
+                "(CASE WHEN EXISTS (SELECT 1 FROM DD_API_STATUS_TBL " +
+                "WHERE DD_UUID = DD_NOTIFICATION_STATUS.DD_UUID AND RESPONSE_STATUS_CODE >= 400) " +
+                "THEN 'FAILED' ELSE 'SUCCESS' END), " +
+                "UPDATED_TS = SYSTIMESTAMP, UPDATED_BY = 'DD_USER' " +
+                "WHERE DD_UUID IN (" + placeholders + ") AND FILE_ID = ?";
+
+        try {
+            Object[] params = new Object[ddUuids.size() + 1];
+            for (int i = 0; i < ddUuids.size(); i++) params[i] = ddUuids.get(i);
+            params[ddUuids.size()] = fileId;
+
+            jdbcTemplate.update(sql, params);
+
+        } catch (Exception e) {
+            logger.error("Bulk update failed for FileId={}: {}", fileId, e.getMessage());
+        }
+    }
+}
+package com.ing.datadist.service;
+
+import com.ing.datadist.dao.FileIngestionDAO;
+import com.ing.datadist.domain.FileIngestionDomain;
+import com.ing.datadist.enums.FileIngestionStatus;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.Resource;
+import org.springframework.stereotype.Service;
+
+import java.io.InputStream;
+import java.util.UUID;
+
+
+@Slf4j
+@Service
+public class FileIngestionService {
+
+    private final FileIngestionDAO fileIngestionDAO;
+
+    public FileIngestionService(FileIngestionDAO fileIngestionDAO) {
+        this.fileIngestionDAO = fileIngestionDAO;
+    }
+
+    /**
+     * Register a new file for ingestion
+     */
+    public String registerFileIngestion(String fileName, String flowName, String flowType,
+                                        String sourceSystem, String frequency, Long totalRecords) {
+        try {
+            FileIngestionDomain fileIngestion = new FileIngestionDomain();
+            String fileId = generateFileId();
+
+            fileIngestion.setFileId(fileId);
+            fileIngestion.setFileName(fileName);
+            fileIngestion.setFlowName(flowName);
+            fileIngestion.setFlowType(flowType);
+            fileIngestion.setSourceSystem(sourceSystem);
+            fileIngestion.setFrequency(frequency);
+            fileIngestion.setStatus(FileIngestionStatus.TO_BE_PROCESSED.getValue());
+            fileIngestion.setTotalRecords(totalRecords != null ? totalRecords : 0L);
+            fileIngestion.setProcessedRecords(0L);
+            fileIngestion.setFailedRecords(0L);
+            fileIngestion.setSkippedRecords(0L);
+            fileIngestion.setRetryCount(0);
+            fileIngestion.setCreatedBy("DD_SYSTEM");
+
+            fileIngestionDAO.insertFileIngestion(fileIngestion);
+            log.info("File Ingestion Service: Registered file - fileId: {}, fileName: {}, flowName: {}, totalRecords: {}",
+                    fileId, fileName, flowName, totalRecords);
+
+            return fileId;
+        } catch (Exception e) {
+            log.error("File Ingestion Service: Error registering file - fileName: {}, error: {}",
+                    fileName, e.getMessage());
+            throw new RuntimeException("Failed to register file ingestion", e);
+        }
+    }
+
+    /**
+     * Update file status to IN_PROGRESS
+     */
+    public void markFileProcessingStart(String fileId, String batchId) {
+        try {
+            fileIngestionDAO.updateProcessingStart(fileId, batchId);
+            log.info("File Ingestion Service: Marked processing start - fileId: {}, batchId: {}", fileId, batchId);
+        } catch (Exception e) {
+            log.error("File Ingestion Service: Error marking processing start - fileId: {}, error: {}",
+                    fileId, e.getMessage());
+            throw new RuntimeException("Failed to mark file processing start", e);
+        }
+    }
+
+    /**
+     * Update file status to COMPLETED with metrics
+     */
+    public void markFileProcessingComplete(String fileId,
+                                           Long totalRecords,
+                                           Long processedRecords,
+                                           Long failedRecords,
+                                           Long fileSize,
+                                           String fileChecksum) {
+
+        fileIngestionDAO.updateFileProcessingEnd(
+                fileId,
+                fileSize,
+                fileChecksum,
+                totalRecords,
+                processedRecords,
+                failedRecords
+        );
+
+        log.info("File Ingestion: COMPLETE - fileId={}, total={}, processed={}, failed={}",
+                fileId, totalRecords, processedRecords, failedRecords);
+    }
+
+    /**
+     * Update file processing metrics during processing
+     */
+    public void updateFileProcessingMetrics(String fileId, Long processedRecords, Long failedRecords, Long skippedRecords) {
+        try {
+            fileIngestionDAO.updateFileMetrics(fileId, processedRecords, failedRecords, skippedRecords);
+            log.info("File Ingestion Service: Updated processing metrics - fileId: {}, processed: {}, failed: {}, skipped: {}",
+                    fileId, processedRecords, failedRecords, skippedRecords);
+        } catch (Exception e) {
+            log.error("File Ingestion Service: Error updating processing metrics - fileId: {}, error: {}",
+                    fileId, e.getMessage());
+            throw new RuntimeException("Failed to update file processing metrics", e);
+        }
+    }
+
+    /**
+     * Mark file as FAILED with error message
+     */
+    public void markFileProcessingFailed(String fileId, String errorMessage) {
+
+        fileIngestionDAO.updateFileIngestionStatus(
+                fileId,
+                FileIngestionStatus.FAILED.getValue(),
+                null,       // keep TOTAL_RECORDS
+                null,       // keep PROCESSED_RECORDS
+                null,       // keep FAILED_RECORDS
+                errorMessage
+        );
+
+        log.info("File Ingestion Service: Marked processing failed - fileId: {}, error: {}",
+                fileId, errorMessage);
+    }
+
+    /**
+     * Update file processing end with file metadata and final metrics
+     */
+    public void updateFileProcessingEnd(String fileId, Long fileSize, String fileChecksum,
+                                        Long totalRecords, Long processedRecords, Long failedRecords) {
+        try {
+            fileIngestionDAO.updateFileProcessingEnd(fileId, fileSize, fileChecksum,
+                    totalRecords, processedRecords, failedRecords);
+            log.info("File Ingestion Service: Updated processing end - fileId: {}, fileSize: {}, " +
+                            "fileChecksum: {}, totalRecords: {}, processedRecords: {}, failedRecords: {}",
+                    fileId, fileSize, fileChecksum, totalRecords, processedRecords, failedRecords);
+        } catch (Exception e) {
+            log.error("File Ingestion Service: Error updating processing end - fileId: {}, error: {}",
+                    fileId, e.getMessage());
+            throw new RuntimeException("Failed to update file processing end", e);
+        }
+    }
+
+    /**
+     * Get file ingestion record by fileId
+     */
+    public FileIngestionDomain getFileIngestion(String fileId) {
+        try {
+            return fileIngestionDAO.getFileIngestionByFileId(fileId);
+        } catch (Exception e) {
+            log.error("File Ingestion Service: Error retrieving file ingestion - fileId: {}, error: {}",
+                    fileId, e.getMessage());
+            throw new RuntimeException("Failed to retrieve file ingestion", e);
+        }
+    }
+
+    /**
+     * Generate unique file ID
+     */
+    private String generateFileId() {
+        return "FILE_" + System.currentTimeMillis() + "_" + UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    public void updateTotalNumberOfRecords(String fileId, Resource resource) {
+        try {
+            long totalRecords;
+
+            long totalLines = 0;
+            StringBuilder currentLine = new StringBuilder();
+            String lastLine = null;
+
+            try (InputStream is = resource.getInputStream()) {
+                int byteRead;
+                boolean hasContent = false;
+
+                while ((byteRead = is.read()) != -1) {
+                    hasContent = true;
+
+                    if (byteRead == '\n') {
+                        totalLines++;
+                        lastLine = currentLine.toString().trim();
+                        currentLine.setLength(0);
+                    } else if (byteRead != '\r') { // handle Windows CRLF safely
+                        currentLine.append((char) byteRead);
+                    }
+                }
+
+                // Check for empty file first
+                if (!hasContent) {
+                    log.warn("File Ingestion Service: Empty file - fileId: {}", fileId);
+                    fileIngestionDAO.updateTotalNumberOfRecords(fileId, 0L, resource.contentLength());
+                    return;
+                }
+                // Handle last line if no trailing newline
+                if (!currentLine.isEmpty()) {
+                    totalLines++;
+                    lastLine = currentLine.toString().trim();
+                }
+
+
+                //  If last line is numeric, return it
+                if (isNumeric(lastLine)) {
+                    long declaredTotalRecords = Long.parseLong(lastLine);
+                    long actualRecords = totalLines - 1; // Excluding header
+                    
+                    // Validate if declared total matches actual records
+                    if (declaredTotalRecords != actualRecords) {
+                        log.error("File Ingestion Service: Record count mismatch - fileId: {}, Declared total records: {}, Actual records: {}",
+                                fileId, declaredTotalRecords, actualRecords);
+                    }
+                    
+                    totalRecords = declaredTotalRecords;
+                    log.info("File Ingestion Service: Extracted record count from last line - fileId: {}, totalRecords: {}",
+                            fileId, totalRecords);
+                } else {
+                    totalRecords = totalLines - 1;
+                    log.info("File Ingestion Service: Calculated record count from total lines - fileId: {}, totalLines: {}, totalRecords: {} (excluding header)",
+                            fileId, totalLines, totalRecords);
+                }
+
+                log.info("File Ingestion Service: File contains {} records - fileId: {}", totalRecords, fileId);
+                fileIngestionDAO.updateTotalNumberOfRecords(fileId, totalRecords, resource.contentLength());
+            }
+
+
+        } catch (Exception e) {
+            log.error("File Ingestion Service: Error while updating TotalNumberOfRecords - fileId: {}, error: {}",
+                    fileId, e.getMessage());
+        }
+    }
+
+
+    private boolean isNumeric(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        for (char c : value.toCharArray()) {
+            if (!Character.isDigit(c)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+}
