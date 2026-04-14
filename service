@@ -1,0 +1,1076 @@
+package com.ing.datadist.api.service;
+
+import com.ing.datadist.api.exception.DataDistributionApiException;
+import com.ing.datadist.api.model.*;
+
+import com.ing.datadist.api.utils.DataDistributionConstants;
+import com.ing.datadist.api.utils.RegkeyEnum;
+import com.ing.datadist.dao.*;
+import com.ing.datadist.api.utils.OnePamDateUtil;
+import com.ing.datadist.configreader.LegalEntityParentConfigReader;
+import com.ing.datadist.domain.LegalEntityChildDomain;
+import com.ing.datadist.domain.LegalEntityParentDomain;
+import com.ing.datadist.enums.RecordType;
+import com.twitter.finagle.http.Response;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+import static com.ing.datadist.api.utils.DataDistributionConstants.*;
+
+@Service
+@Slf4j
+public class OrganisationService {
+
+    private final OrganisationOnePamRepository organisationOnePamRepository;
+    private final InvolvedPartyOnePamRepository involvedPartyOnePamRepository;
+    private final LegalEntityParentConfigReader configReader;
+    private final OrgParentAccountingDAO orgParentAccountingDAO;
+    private final OrgChildAccountingDAO orgChildAccountingDAO;
+    private final MappingDAO mappingDAO;
+    private final ApiTransactionLogDAO apiTransactionLogDAO;
+    private final AddressService addressService;
+    private final OrganisationNameService organisationNameService;
+    private final OrganisationAssessmentService organisationAssessmentService;
+    private final IndustryClassificationService industryClassificationService;
+    private final DigitalAddrService digitalAddrService;
+    private final ErrorLogDAO  errorLogDAO;
+
+    public OrganisationService(OrganisationOnePamRepository organisationOnePamRepository,
+                               LegalEntityParentConfigReader configReader,
+                               InvolvedPartyOnePamRepository involvedPartyOnePamRepository,
+                               OrgParentAccountingDAO orgParentAccountingDAO,
+                               MappingDAO mappingDAO,
+                               ApiTransactionLogDAO apiTransactionLogDAO,
+                               AddressService addressService,
+                               OrganisationNameService organisationNameService,
+                               OrganisationAssessmentService organisationAssessmentService,
+                               IndustryClassificationService industryClassificationService,
+                               OrgChildAccountingDAO orgChildAccountingDAO,
+                               DigitalAddrService digitalAddrService,
+                               ErrorLogDAO errorLogDAO) {
+        this.organisationOnePamRepository = organisationOnePamRepository;
+        this.configReader = configReader;
+        this.involvedPartyOnePamRepository = involvedPartyOnePamRepository;
+        this.orgParentAccountingDAO = orgParentAccountingDAO;
+        this.mappingDAO = mappingDAO;
+        this.apiTransactionLogDAO = apiTransactionLogDAO;
+        this.addressService = addressService;
+        this.organisationNameService = organisationNameService;
+        this.organisationAssessmentService = organisationAssessmentService;
+        this.industryClassificationService = industryClassificationService;
+        this.orgChildAccountingDAO = orgChildAccountingDAO;
+        this.digitalAddrService = digitalAddrService;
+        this.errorLogDAO = errorLogDAO;
+    }
+
+    public void processOrganisation(String ddUuid, LegalEntityParentDomain wrapper, List<LegalEntityChildDomain> childWrappers) {
+
+        CreateInvolvedPartyResponseV5 response = null;
+        try {
+            response = createOrganisation(ddUuid, wrapper);
+
+            apiTransactionLogDAO.logApiSuccess(
+                    ddUuid,
+                    wrapper.getFileId(),
+                    COFACE_LE_PARENT_FLOW,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.endpoint,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.method,
+                    200
+            );
+
+            orgParentAccountingDAO.insertFullOrganisation(response, wrapper.getFileId(),wrapper);
+        } catch (Exception e) {
+
+
+            apiTransactionLogDAO.logApiFailure(
+                    ddUuid,
+                    wrapper.getFileId(),
+                    COFACE_LE_PARENT_FLOW,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.endpoint,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.method,
+                    "API_ERROR",
+                    extractInnerMessage(e)
+            );
+            errorLogDAO.logApiError(
+                    RecordType.ORGANISATION_PARENT,
+                    wrapper.getLeExternalIdentifier(),
+                    ddUuid,
+                    null,
+                    "Create organisation failed: " + extractInnerMessage(e),
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.endpoint,
+                    null,
+                    null,
+                    null,
+                    wrapper.getFileName(),
+                    wrapper.getFileId()
+            );
+            log.error("Failed to create organisation for ddUuid: {}", ddUuid, e);
+            try {
+                apiTransactionLogDAO.updateNotificationStatusByUuid(ddUuid, wrapper.getFileId());
+                log.info("Data_Distributor_Coface_ORG Updated notification status for dd_uuid:{} after organisation creation failure", ddUuid);
+            } catch (Exception statusEx) {
+                log.error("Failed to update notification status for dd_uuid:{}, error:{}", ddUuid, statusEx.getMessage());
+                errorLogDAO.logDatabaseError(RecordType.ORGANISATION_PARENT, wrapper.getLeExternalIdentifier(), ddUuid, "Failed to update notification status for dd_uuid" + extractInnerMessage(e), null, wrapper.getFileName(), null, wrapper.getFileId() );
+            }
+            return;
+        }
+
+        String onePamUUID = response.getOrganisation().getInvolvedPartyIdentifier();
+        if (onePamUUID != null && !onePamUUID.isBlank()) {
+            updateExternalIdentifier(ddUuid, onePamUUID, wrapper);
+        } else {
+            log.warn("No onePamUUID found; skipping external ID update for ddUuid {}", ddUuid);
+        }
+
+        CreatePostalAddressRequest postalRequest = new CreatePostalAddressRequest();
+        postalRequest.setHouseNumber(wrapper.getAdrPostalAddressHouseNum());
+        postalRequest.setPostalCode(wrapper.getAdrPostalAddressPostalCode());
+        postalRequest.setCountryCode(wrapper.getAdrPostalAddressCountryCode());
+        postalRequest.setHouseNumberAddition(wrapper.getAdrPostalAddressHouseNumAdd());
+        postalRequest.setCityName(wrapper.getAdrPostalAddressCityName());
+        postalRequest.setStreetName(wrapper.getAdrPostalAddressStreetName());
+        postalRequest.setUnstructuredAddressLine(wrapper.getAdrUnstructuredAddress());
+        postalRequest.setDataSource(DATA_SOURCE);
+
+        try {
+            log.info("Data_Distributor_Coface_ORG Calling PostalAddress-API for dd_uuid:{}, onePamUuid:{}", ddUuid, onePamUUID);
+            PostalAddressResponse addr = addressService.createPostalAddress(onePamUUID, postalRequest, wrapper.getFileId());
+
+            if (addr != null) {
+                apiTransactionLogDAO.logApiSuccess(
+                        ddUuid,
+                        wrapper.getFileId(),
+                        COFACE_LE_PARENT_FLOW,
+                        RegkeyEnum.CREATE_POSTAL_ADDRESS.resolveEndpoint(onePamUUID),
+                        RegkeyEnum.CREATE_POSTAL_ADDRESS.method,
+                        200
+                );
+
+                orgParentAccountingDAO.insertPostalAddrWithWrapperLE(ddUuid, postalRequest.getStreetName(), postalRequest.getHouseNumber(),
+                        postalRequest.getHouseNumberAddition(), postalRequest.getPostalCode(), postalRequest.getCityName(), postalRequest.getCountryCode(), postalRequest.getUnstructuredAddressLine(), wrapper.getFileId());
+                log.info("Data_Distributor_Coface_ORG PostalAddress-API call success for dd_uuid:{}, onePamUuid:{}", ddUuid, onePamUUID);
+            } else {
+                log.warn("Postal address response was null for UUID={}", ddUuid);
+            }
+        } catch (Exception e) {
+            apiTransactionLogDAO.logApiFailure(
+                    ddUuid,
+                    wrapper.getFileId(),
+                    COFACE_LE_PARENT_FLOW,
+                    RegkeyEnum.CREATE_POSTAL_ADDRESS.resolveEndpoint(onePamUUID),
+                    RegkeyEnum.CREATE_POSTAL_ADDRESS.method,
+                    "API_ERROR",
+                    extractInnerMessage(e)
+            );
+            errorLogDAO.logApiError(
+                    RecordType.ORGANISATION_PARENT,
+                    wrapper.getLeExternalIdentifier(),
+                    ddUuid,
+                    null,
+                    "Postal address create failed: " + extractInnerMessage(e),
+                    RegkeyEnum.CREATE_POSTAL_ADDRESS.endpoint,
+                    null,
+                    null,
+                    null,
+                    wrapper.getFileName(),
+                    wrapper.getFileId()
+            );
+            log.error("Postal address create failed for UUID={} : {}", ddUuid, extractInnerMessage(e), e);
+        }
+
+        try {
+            String tel = wrapper.getAdrDigitalAddrFullTel();
+
+            log.info("Data_Distributor_Coface_ORG Checking digital addresses for dd_uuid:{} tel='{}' ",
+                    ddUuid, tel);
+
+            if (tel != null && !tel.isBlank()) {
+                log.info("Data_Distributor_Coface_ORG Creating EMAIL digital address for onePamUuid:{} value:{}",
+                        onePamUUID, tel);
+
+                CreateDigitalAddressV5Request requestForPhone =
+                        digitalAddrService.buildCreateRequestForPhone(onePamUUID, tel);
+
+
+                digitalAddrService.createDigitalAddr_LE(ddUuid, onePamUUID, requestForPhone);
+                orgParentAccountingDAO.updateDigitalAddress_LE_phone(ddUuid, wrapper.getAdrDigitalAddrFullTel(),wrapper.getFileId());
+                apiTransactionLogDAO.logApiSuccess(
+                        ddUuid,
+                        wrapper.getFileId(),
+                        COFACE_LE_PARENT_FLOW,
+                        RegkeyEnum.CREATE_DIGITAL_ADDRESS.endpoint,
+                        RegkeyEnum.CREATE_DIGITAL_ADDRESS.method,
+                        200
+                );
+
+                log.info("TELEPHONE digital address created successfully for {}", onePamUUID);
+            }
+
+            if ((tel == null || tel.isBlank())){
+                log.info("Data_Distributor_Coface_ORG No digital address (phone) provided for onePamUuid:{}, skipping.",
+                        onePamUUID);
+            }
+
+        } catch (Exception e) {
+            log.error("Data_Distributor_Coface_ORG Digital address creation failed for dd_uuid={} : {}", ddUuid, extractInnerMessage(e), e);
+
+            apiTransactionLogDAO.logApiFailure(
+                    ddUuid,
+                    wrapper.getFileId(),
+                    COFACE_LE_PARENT_FLOW,
+                    RegkeyEnum.CREATE_DIGITAL_ADDRESS.endpoint,
+                    RegkeyEnum.CREATE_DIGITAL_ADDRESS.method,
+                    "API_ERROR",
+                    extractInnerMessage(e)
+            );
+            errorLogDAO.logApiError(
+                    RecordType.ORGANISATION_PARENT,
+                    wrapper.getLeExternalIdentifier(),
+                    ddUuid,
+                    null,
+                    "CREATE_DIGITAL_ADDRESS failed: " + extractInnerMessage(e),
+                    RegkeyEnum.CREATE_DIGITAL_ADDRESS.endpoint,
+                    null,
+                    null,
+                    null,
+                    wrapper.getFileName(),
+                    wrapper.getFileId()
+            );
+        }
+        try {
+            String typeFromFile = ASSESSMENT_TYPE;
+            String resultTypeFromFile = "I";
+            String effectiveDateFromFile = wrapper.getOrgDateOfFoundation();
+            String dataSourceFromFile = DATA_SOURCE;
+
+            CreateAssessmentRequest assessmentRequest =
+                    organisationAssessmentService.buildAssessmentRequest(
+                            typeFromFile,
+                            resultTypeFromFile,
+                            dataSourceFromFile,
+                            effectiveDateFromFile
+                    );
+
+            log.info("Calling createAssessment for dd_uuid:{}, onePamUuid:{}", ddUuid, onePamUUID);
+            CreateAssessmentResponse asmtResp =
+                    organisationAssessmentService.createAssessment(onePamUUID, assessmentRequest, wrapper.getFileId());
+            apiTransactionLogDAO.logApiSuccess(
+                    ddUuid,
+                    wrapper.getFileId(),
+                    COFACE_LE_PARENT_FLOW,
+                    RegkeyEnum.CREATE_ASSESSMENT.resolveEndpoint(onePamUUID),
+                    RegkeyEnum.CREATE_ASSESSMENT.method,
+                    200
+            );
+
+            log.info("Assessment created for dd_uuid:{}, onePamUuid:{}, response: {}",
+                    ddUuid, onePamUUID, asmtResp);
+
+            orgParentAccountingDAO.insertAssessment(ddUuid, asmtResp.getAssessment().getResultType());
+
+        } catch (Exception e) {
+            apiTransactionLogDAO.logApiFailure(
+                    ddUuid,
+                    wrapper.getFileId(),
+                    COFACE_LE_PARENT_FLOW,
+                    RegkeyEnum.CREATE_ASSESSMENT.resolveEndpoint(onePamUUID),
+                    RegkeyEnum.CREATE_ASSESSMENT.method,
+                    "API_ERROR",
+                    extractInnerMessage(e)
+            );
+            errorLogDAO.logApiError(
+                    RecordType.ORGANISATION_PARENT,
+                    wrapper.getLeExternalIdentifier(),
+                    ddUuid,
+                    null,
+                    "CREATE_ASSESSMENT failed: " + extractInnerMessage(e),
+                    RegkeyEnum.CREATE_ASSESSMENT.endpoint,
+                    null,
+                    null,
+                    null,
+                    wrapper.getFileName(),
+                    wrapper.getFileId()
+            );
+            log.error("Assessment creation failed for dd_uuid:{}, onePamUuid:{}; cause: {}",
+                    ddUuid, onePamUUID, extractInnerMessage(e), e);
+        }
+
+        try {
+            if (childWrappers != null && !childWrappers.isEmpty()) {
+
+                for (LegalEntityChildDomain child : childWrappers) {
+                    String code = child.getIndustryClassCode();
+                    if (code == null || code.isBlank()) {
+                        log.info("Industry classification not available in child row for ddUuid:{}; skipping", ddUuid);
+                        continue;
+                    }
+
+
+                    CreateOrganisationIndustryClassificationRequest industryClassificationRequest =
+                            CreateOrganisationIndustryClassificationRequest.builder()
+                                    .industryClassificationIssuerType(LE_INDUSTRY_CLASSIFICATION_ISSUER_TYPE)
+                                    .industryClassificationCode(child.getIndustryClassCode())
+                                    .rank(child.getIndustryClassRank())
+                                    .effectiveDate(OnePamDateUtil.toOnePamDate(child.getIndustryClassEffDate()))
+                                    .endDate(OnePamDateUtil.toOnePamDate(child.getIndustryClassEndDate()))
+                                    .build();
+
+                    log.info("Calling IndustryClassificationService.addIndustryClassification for dd_uuid:{}, onePamUuid:{}, payload:{}",
+                            ddUuid, onePamUUID, industryClassificationRequest);
+
+                    try {
+                        CreateOrganisationIndustryClassificationResponse icResp =
+                                industryClassificationService.addIndustryClassification(onePamUUID, industryClassificationRequest, wrapper.getFileId());
+
+                        apiTransactionLogDAO.logApiSuccess(
+                                ddUuid,
+                                wrapper.getFileId(),
+                                COFACE_LE_PARENT_FLOW,
+                                RegkeyEnum.CREATE_INDUSTRY_CLASSIFICATION.resolveEndpoint(onePamUUID),
+                                RegkeyEnum.CREATE_INDUSTRY_CLASSIFICATION.method,
+                                200
+                        );
+
+                        log.info("Industry classification created for dd_uuid:{}, onePamUuid:{}, response:{}",
+                                ddUuid, onePamUUID, icResp);
+
+                        orgChildAccountingDAO.insertIndustryClassification(
+                                ddUuid,
+                                industryClassificationRequest.getIndustryClassificationCode(),
+                                String.valueOf(industryClassificationRequest.getRank()),
+                                industryClassificationRequest.getEffectiveDate(),
+                                industryClassificationRequest.getEndDate(),
+                                wrapper.getLeExternalIdentifier(),
+                                wrapper.getFileId()
+                        );
+                    } catch (Exception icException) {
+                        apiTransactionLogDAO.logApiFailure(
+                                ddUuid,
+                                wrapper.getFileId(),
+                                COFACE_LE_PARENT_FLOW,
+                                RegkeyEnum.CREATE_INDUSTRY_CLASSIFICATION.resolveEndpoint(onePamUUID),
+                                RegkeyEnum.CREATE_INDUSTRY_CLASSIFICATION.method,
+                                "API_ERROR",
+                                icException.getMessage()
+                        );
+                        errorLogDAO.logApiError(
+                                RecordType.ORGANISATION_PARENT,
+                                wrapper.getLeExternalIdentifier(),
+                                ddUuid,
+                                null,
+                                "CREATE_INDUSTRY_CLASSIFICATION failed: " + extractInnerMessage(icException),
+                                RegkeyEnum.CREATE_INDUSTRY_CLASSIFICATION.endpoint,
+                                null,
+                                null,
+                                null,
+                                wrapper.getFileName(),
+                                wrapper.getFileId()
+                        );
+                        log.error("Industry classification creation failed for dd_uuid:{}, onePamUuid:{}; cause:{}",
+                                ddUuid, onePamUUID, icException.getMessage(), icException);
+                    }
+
+                }
+
+            } else {
+                log.info("No child rows provided for industry classification creation for ddUuid {}", ddUuid);
+            }
+
+        } catch (Exception e) {
+            log.error("Industry classification creation failed for dd_uuid:{}, onePamUuid:{}; cause:{}",
+                    ddUuid, onePamUUID, extractInnerMessage(e), e);
+
+        }
+        try {
+            apiTransactionLogDAO.updateNotificationStatusByUuid(ddUuid, wrapper.getFileId());
+            log.info("Data_Distributor_Coface_ORG Updated notification status for dd_uuid:{}", ddUuid);
+        } catch (Exception e) {
+            log.error("Failed to update notification status for dd_uuid:{}, error:{}", ddUuid, extractInnerMessage(e));
+            errorLogDAO.logDatabaseError(RecordType.ORGANISATION_PARENT, wrapper.getLeExternalIdentifier(), ddUuid, "Failed to update notification status for dd_uuid" + extractInnerMessage(e), null, wrapper.getFileName(), null, wrapper.getFileId() );
+        }
+    }
+
+    public CreateInvolvedPartyResponseV5 createOrganisation(String ddUuid, LegalEntityParentDomain wrapper) {
+        log.info("Data_Distributor_Coface_ORG Creating organisation with Primary Name: {}, Other Name: {}",
+                wrapper.getOrgName(), wrapper.getOrgOtherName());
+        log.info("Data_Distributor_Coface_ORG Name Types - Primary: {}, Other: {}",
+                ORGANISATION_NAME_TYPE, ORGANISATION_OTHER_NAME_TYPE);
+        String effDate = OnePamDateUtil.toOnePamDate(null);
+
+        List<CreateOrganisationNameRequest> organisationNamesList = new ArrayList<>();
+
+        if (wrapper.getOrgName() != null && !wrapper.getOrgName().isBlank()) {
+            organisationNamesList.add(
+                    CreateOrganisationNameRequest.builder()
+                            .organisationNameType(ORGANISATION_NAME_TYPE)
+                            .organisationName(wrapper.getOrgName())
+                            .dataSource(DATA_SOURCE)
+                            .build()
+            );
+        }
+
+        /* Add other organisation name if present */
+        if (wrapper.getOrgOtherName() != null && !wrapper.getOrgOtherName().isBlank()) {
+            organisationNamesList.add(
+                    CreateOrganisationNameRequest.builder()
+                            .organisationNameType(ORGANISATION_OTHER_NAME_TYPE)
+                            .organisationName(wrapper.getOrgOtherName())
+                            .dataSource(DATA_SOURCE)
+                            .build()
+            );
+        }
+
+        log.info("Data_Distributor_Coface_ORG Total organisation names to create: {}", organisationNamesList.size());
+
+        CreateOrganisationRequest.CreateOrganisationRequestBuilder orgBuilder = CreateOrganisationRequest.builder()
+                .dataSource(DATA_SOURCE)
+                .logicalDataDomain(LOGICAL_DATA_DOMAIN)
+                .countryOfResidence(wrapper.getAdrPostalAddressCountryCode())
+                .preferredLanguage(wrapper.getLEPreferredLanguage())
+                .channelOfEntry(CHANNEL_OF_ENTRY)
+                .dateOfFoundation(wrapper.getOrgDateOfFoundation())
+                .effectiveDate(effDate)
+                .financialLegalStatusType(wrapper.getLELegalStatus()) //legal status
+                .organisationLifeCycleStatusType(wrapper.getOrgStatus()) //org status
+                .legalForm(wrapper.getOrgLegalForm())
+                .businessClosedDownDate(wrapper.getOrgBusinessClosedownDate())
+                .involvedPartyInternalIdentifiers(Collections.singletonList(
+                        CreateInternalIdentifierRequest.builder()
+                                .involvedPartyInternalIdentifierType(DD_IDENTIFIER_TYPE)
+                                .involvedPartyInternalIdentifierValue(ddUuid)
+                                .build()
+                ))
+                .organisationNames(organisationNamesList);
+
+        CreateInvolvedPartyRequestV5 request = CreateInvolvedPartyRequestV5.builder().organisation(orgBuilder.build()).build();
+        try {
+            CreateInvolvedPartyResponseV5 resp =
+                    involvedPartyOnePamRepository.createInvolvedParty(request).get();
+
+            apiTransactionLogDAO.logApiSuccess(
+                    ddUuid,
+                    wrapper.getFileId(),
+                    COFACE_LE_PARENT_FLOW,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.endpoint,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.method,
+                    200
+            );
+
+            return resp;
+
+        } catch (Exception e) {
+
+            apiTransactionLogDAO.logApiFailure(
+                    ddUuid,
+                    wrapper.getFileId(),
+                    COFACE_LE_PARENT_FLOW,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.endpoint,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.method,
+                    "API_ERROR",
+                    extractInnerMessage(e)
+            );
+
+            log.error("Create failed for ddUuid {}: {}", ddUuid, extractInnerMessage(e), e);
+            throw new RuntimeException("Create organisation interrupted", e);
+        }
+    }
+
+    public void updateExternalIdentifier(String ddUuid, String onePamUUID, LegalEntityParentDomain wrapper) {
+        try {
+            String externalIdentifier = wrapper.getLeExternalIdentifier();
+            UpdateExternalIdentifierInvolvedPartyRequest updateRequest = buildUpdateRequest(ddUuid, wrapper, externalIdentifier, false);
+
+            try {
+                Response resp = involvedPartyOnePamRepository.updateExternalIdentifier(onePamUUID, updateRequest).get();
+
+                // Log successful KBO external identifier API transaction
+                apiTransactionLogDAO.logApiSuccess(
+                        ddUuid,
+                        wrapper.getFileId(),
+                        COFACE_LE_PARENT_FLOW,
+                        RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.resolveEndpoint(onePamUUID),
+                        RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.method,
+                        200
+                );
+
+                orgParentAccountingDAO.updateExternalIdentifierLE(ddUuid, externalIdentifier, wrapper.getOrgDateOfFoundation(),wrapper.getOrgBusinessClosedownDate(), wrapper.getFileId());
+            } catch (Exception kboException) {
+                // Log failed KBO external identifier API transaction
+                apiTransactionLogDAO.logApiFailure(
+                        ddUuid,
+                        wrapper.getFileId(),
+                        "COFACE_LE_PARENT",
+                        RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.resolveEndpoint(onePamUUID),
+                        RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.method,
+                        "API_ERROR",
+                        extractInnerMessage(kboException)
+                );
+                errorLogDAO.logApiError(
+                        RecordType.ORGANISATION_PARENT,
+                        wrapper.getLeExternalIdentifier(),
+                        ddUuid,
+                        null,
+                        "UPDATE EXTERNAL IDENTIFIER: " + extractInnerMessage(kboException),
+                        RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.endpoint,
+                        null,
+                        null,
+                        null,
+                        wrapper.getFileName(),
+                        wrapper.getFileId()
+                );
+                throw kboException;
+            }
+
+            String nssoExternalIdentifier = wrapper.getNssoExternalIdentifier();
+            String nssoStatus = wrapper.getNssoExternalIdentifierStatus();
+
+            if (nssoExternalIdentifier != null && !nssoExternalIdentifier.isBlank()) {
+                UpdateExternalIdentifierInvolvedPartyRequest nssoUpdateRequest = buildUpdateRequest(ddUuid, wrapper, nssoExternalIdentifier, true);
+
+                try {
+                    Response respNsso = involvedPartyOnePamRepository.updateExternalIdentifier(onePamUUID, nssoUpdateRequest).get();
+
+                    // Log successful NSSO external identifier API transaction
+                    apiTransactionLogDAO.logApiSuccess(
+                            ddUuid,
+                            wrapper.getFileId(),
+                            "COFACE_LE_PARENT",
+                            RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.resolveEndpoint(onePamUUID),
+                            RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.method,
+                            200
+                    );
+
+                    orgParentAccountingDAO.updateExternalIdentifierNSSO(ddUuid, wrapper.getNssoExternalIdentifierStatus(), wrapper.getNssoExternalIdentifier(), wrapper.getFileId());
+                } catch (Exception nssoException) {
+                    // Log failed NSSO external identifier API transaction
+                    apiTransactionLogDAO.logApiFailure(
+                            ddUuid,
+                            wrapper.getFileId(),
+                            COFACE_LE_PARENT_FLOW,
+                            RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.resolveEndpoint(onePamUUID),
+                            RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.method,
+                            "API_ERROR",
+                            extractInnerMessage(nssoException)
+                    );
+                    errorLogDAO.logApiError(
+                            RecordType.ORGANISATION_PARENT,
+                            wrapper.getLeExternalIdentifier(),
+                            ddUuid,
+                            null,
+                            "UPDATE_EXTERNAL_IDENTIFIER FAILED: " + extractInnerMessage(nssoException),
+                            RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.endpoint,
+                            null,
+                            null,
+                            null,
+                            wrapper.getFileName(),
+                            wrapper.getFileId()
+                    );
+                    log.error("NSSO external identifier update failed for ddUuid: {}", ddUuid, nssoException);
+                }
+            }
+        } catch (Exception e) {
+            log.error("Update external identifier failed for ddUuid {}: {}", ddUuid, extractInnerMessage(e), e);
+        }
+    }
+
+    private UpdateExternalIdentifierInvolvedPartyRequest buildUpdateRequest(String uuid, LegalEntityParentDomain wrapper, String externalIdentifierValue, boolean isNssoIdentifier) {
+        String finalExternalIdentifier = (externalIdentifierValue != null && !externalIdentifierValue.isBlank())
+                ? externalIdentifierValue
+                : isNssoIdentifier ? wrapper.getNssoExternalIdentifier() : wrapper.getLeExternalIdentifier();
+
+        String type = isNssoIdentifier ? EXTERNAL_ID_TYPE_NSSO : EXTERNAL_ID_TYPE_KBO;
+        UpdateExternalIdentifierInvolvedPartyRequest.UpdateExternalIdentifierInvolvedPartyRequestBuilder builder =
+                UpdateExternalIdentifierInvolvedPartyRequest.builder()
+                        .dataSource(DataDistributionConstants.DATA_SOURCE)
+                        .involvedPartyExternalIdentifierType(type)
+                        .effectiveDate(OnePamDateUtil.toOnePamDate(wrapper.getOrgDateOfFoundation()))
+                        .involvedPartyExternalIdentifierValue(finalExternalIdentifier);
+//                        .involvedPartyExternalIdentifierStatusType("ACTV");
+        return builder.build();
+    }
+
+    public GetInvolvedPartyResponseV6 updateOrganisation(String onePamUUID, LegalEntityParentDomain wrapper) {
+        try {
+            UpdateOrganisationRequest.Organisation org = UpdateOrganisationRequest.Organisation.builder()
+                    .dataSource(DATA_SOURCE)
+                    .countryOfResidence(wrapper.getAdrPostalAddressCountryCode())
+                    .preferredLanguage(wrapper.getLEPreferredLanguage())
+                    .financialLegalStatusType(wrapper.getLELegalStatus())
+                    .channelOfEntry(CHANNEL_OF_ENTRY)
+                    .effectiveDate(OnePamDateUtil.toOnePamDate(wrapper.getOrgDateOfFoundation()))
+                    .legalForm(wrapper.getOrgLegalForm())
+                    .dateOfFoundation(wrapper.getOrgDateOfFoundation())
+                    .businessClosedDownDate(wrapper.getOrgBusinessClosedownDate())
+                    .organisationLifeCycleStatusType(wrapper.getOrgStatus())
+                    .build();
+            UpdateOrganisationRequest request = UpdateOrganisationRequest.builder().organisation(org).build();
+            return organisationOnePamRepository.updateOrganisation(onePamUUID, request).get();
+        } catch (Exception e) {
+            log.error("updateOrganisation failed for onePamUUID {}: {}", onePamUUID, extractInnerMessage(e), e);
+            throw new RuntimeException("updateOrganisation failed", e);
+        }
+    }
+
+    private String extractInnerMessage(Throwable e) {
+        if (e instanceof DataDistributionApiException) {
+            String inner = ((DataDistributionApiException) e).getInnerMessage();
+            return (inner == null || inner.isBlank()) ? e.getMessage() : inner;
+        }
+        return e.getMessage();
+    }
+
+
+}package com.ing.datadist.api.service;
+
+import com.ing.datadist.api.model.*;
+import com.ing.datadist.api.utils.RegkeyEnum;
+import com.ing.datadist.configreader.CofaceOpsConfigReader;
+import com.ing.datadist.dao.ApiTransactionLogDAO;
+import com.ing.datadist.dao.ErrorLogDAO;
+import com.ing.datadist.dao.MappingDAO;
+import com.ing.datadist.dao.OrgUnitAccountingDAO;
+import com.ing.datadist.api.utils.OnePamDateUtil;
+import com.ing.datadist.domain.OrganisationUnitDomainWrapper;
+import com.ing.datadist.enums.RecordType;
+import com.twitter.finagle.http.Response;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+import static com.ing.datadist.api.utils.DataDistributionConstants.*;
+
+@Service
+@Slf4j
+public class OrganisationUnitService {
+
+    private final OrganisationUnitOnePamRepository organisationUnitOnePamRepository;
+    private final InvolvedPartyOnePamRepository invPartyOnePamRepository;
+    private final CofaceOpsConfigReader configReader;
+    private final AddressService addressService;
+    private final DigitalAddrService digitalAddrService;
+    private final OrgUnitAccountingDAO orgUnitAccountingDAO;
+    private final InvolvedPartySearchService involvedPartySearchService;
+    private final ErrorLogDAO errorLogDAO;
+    private final ApiTransactionLogDAO apiTransactionLogDAO;
+    private final MappingDAO mappingDAO;
+
+    public OrganisationUnitService(OrganisationUnitOnePamRepository organisationUnitOnePamRepository,
+                                   InvolvedPartyOnePamRepository invPartyOnePamRepository,
+                                   CofaceOpsConfigReader configReader,
+                                   AddressService addressService,
+                                   DigitalAddrService digitalAddrService,
+                                   OrgUnitAccountingDAO orgUnitAccountingDAO,
+                                   InvolvedPartySearchService involvedPartySearchService,
+                                   ErrorLogDAO errorLogDAO,
+                                   ApiTransactionLogDAO apiTransactionLogDAO,
+                                   MappingDAO mappingDAO) {
+        this.organisationUnitOnePamRepository = organisationUnitOnePamRepository;
+        this.invPartyOnePamRepository = invPartyOnePamRepository;
+        this.configReader = configReader;
+        this.addressService = addressService;
+        this.digitalAddrService = digitalAddrService;
+        this.orgUnitAccountingDAO = orgUnitAccountingDAO;
+        this.involvedPartySearchService = involvedPartySearchService;
+        this.errorLogDAO = errorLogDAO;
+        this.apiTransactionLogDAO = apiTransactionLogDAO;
+        this.mappingDAO = mappingDAO;
+    }
+
+    public void processOrganisationUnit(String dduuid, String opsNumber, OrganisationUnitDomainWrapper wrapper) {
+
+        Map<String, String> config = getConfig(opsNumber);
+        log.info("Processing Organisation Unit {}", opsNumber);
+
+        String onePamUUID = "";
+
+        CreateInvolvedPartyResponseV5 response = null;
+        try {
+            response = createOrganisationUnit(dduuid, wrapper);
+            apiTransactionLogDAO.logApiSuccess(
+                    dduuid,
+                    wrapper.getFileId(),
+                    COFACE_OPS_FLOW,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.endpoint,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.method,
+                    200
+            );
+            orgUnitAccountingDAO.insertFullOrganisationUnit(response);
+
+        } catch (Exception e) {
+            apiTransactionLogDAO.logApiFailure(
+                    dduuid,
+                    wrapper.getFileId(),
+                    COFACE_OPS_FLOW,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.endpoint,
+                    RegkeyEnum.CREATE_INVOLVED_PARTY.method,
+                    "API_ERROR",
+                    e.getMessage()
+            );
+            try {
+                apiTransactionLogDAO.updateNotificationStatusByUuid(dduuid, wrapper.getFileId());
+                log.info("Data_Distributor_Coface_OPS Updated notification status for dd_uuid:{} after organisation creation failure", dduuid);
+            } catch (Exception statusEx) {
+                log.error("Failed to update notification status for dd_uuid:{}, error:{}", dduuid, statusEx.getMessage());
+            }
+            return;
+
+        }
+        InvolvedPartiesOrganisationUnitResponse getOrganisationUnit = response.getOrganisationUnit();
+
+        onePamUUID = getOrganisationUnit.getInvolvedPartyIdentifierValue();
+        log.info("Involved Party Internal Identifiers : " + onePamUUID);
+        if (onePamUUID == null || onePamUUID.isBlank() || onePamUUID.isEmpty()) {
+            log.warn("No involvedPartyIdentifier found in response. Skipping OU flow.");
+            return;
+        }
+
+        wrapper.setOnePamUuid(onePamUUID);
+        UpdateExternalIdentifierInvolvedPartyRequest updateRequest = buildUpdateRequest(dduuid, wrapper);
+
+        try {
+
+            apiTransactionLogDAO.logApiSuccess(
+                    dduuid,
+                    wrapper.getFileId(),
+                    COFACE_OPS_FLOW,
+                    RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.endpoint,
+                    RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.method,
+                    200
+            );
+
+            log.info("Data_Distributor_Coface_OU Calling UpdateExternalIdentifier-API for dd_uuid:{}, onePamUuid:{}", dduuid, onePamUUID);
+
+            Response responseUpdateExternalIdentifier =
+                    invPartyOnePamRepository.updateExternalIdentifier(onePamUUID, updateRequest).get();
+
+            orgUnitAccountingDAO.updateExternalIdentifier(
+                    dduuid,
+                    wrapper.getOrgExternalIdentifierVal(),
+                    updateRequest.getEffectiveDate(),
+                    wrapper.getOpsExternalIdentifierVal(),
+                    wrapper.getFileId()
+            );
+
+            if (responseUpdateExternalIdentifier.statusCode() < 200 || responseUpdateExternalIdentifier.statusCode() >= 300) {
+                log.error("Failed to update external identifier for external identifier: " + dduuid);
+            }
+
+        } catch (Exception e) {
+            log.error("External ID update failed for UUID={} : {}", dduuid, e.getMessage(), e);
+
+            String apiEndpoint = RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.resolveEndpoint(onePamUUID);
+            errorLogDAO.logApiError(
+                    RecordType.INVOLVED_PARTY,
+                    wrapper.getOpsExternalIdentifierVal(),
+                    dduuid,
+                    null,
+                    "Failed to update external identifier: " + e.getMessage(),
+                    apiEndpoint,
+                    null,
+                    null,
+                    null, // Batch ID
+                    null, // File name
+                    wrapper.getFileId()
+            );
+            apiTransactionLogDAO.logApiFailure(
+                    dduuid,
+                    wrapper.getFileId(),
+                    COFACE_OPS_FLOW,
+                    RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.endpoint,
+                    RegkeyEnum.UPDATE_EXTERNAL_IDENTIFIER.method,
+                    "API_ERROR",
+                    e.getMessage()
+            );
+            try {
+                apiTransactionLogDAO.updateNotificationStatusByUuid(dduuid, wrapper.getFileId());
+                log.info("Data_Distributor_Coface_OPS Updated notification status for dd_uuid:{} after organisation creation failure", dduuid);
+            } catch (Exception statusEx) {
+                log.error("Failed to update notification status for dd_uuid:{}, error:{}", dduuid, statusEx.getMessage());
+            }
+        }
+
+        CreatePostalAddressRequest postalRequest = new CreatePostalAddressRequest();
+        postalRequest.setHouseNumber(wrapper.getPostalAddressHouseNum());
+        log.info("HOUSE NUM " + wrapper.getPostalAddressHouseNum());
+        log.info("Postal address " + postalRequest.getHouseNumber());
+        postalRequest.setPostalCode(wrapper.getPostalAddressPostalCd());
+        postalRequest.setCountryCode(wrapper.getPostalAddressCntryCd());
+        postalRequest.setHouseNumberAddition(wrapper.getPostalAddressHouseAdd());
+        postalRequest.setCityName(wrapper.getPostalAddressCityName());
+        postalRequest.setStreetName(wrapper.getPostalAddressStreetNm());
+        postalRequest.setUnstructuredAddressLine(wrapper.getAddress());
+        postalRequest.setDataSource(DATA_SOURCE);
+        try {
+            log.info("Data_Distributor_Coface_OU Calling PostalAddress-API for dd_uuid:{}, onePamUuid:{}", dduuid, onePamUUID);
+
+            PostalAddressResponse addr = addressService.createPostalAddress(onePamUUID, postalRequest, wrapper.getFileId());
+            if (addr != null) {
+                orgUnitAccountingDAO.insertPostalAddrWithWrapper(
+                        dduuid,
+                        postalRequest.getStreetName(),
+                        postalRequest.getHouseNumber(),
+                        postalRequest.getHouseNumberAddition(),
+                        postalRequest.getPostalCode(),
+                        postalRequest.getCityName(),
+                        postalRequest.getCountryCode(),
+                        postalRequest.getUnstructuredAddressLine(),
+                        wrapper.getFileId()
+                );
+                log.info("Data_Distributor_Coface_OU PostalAddress-API call success for dd_uuid:{}, onePamUuid:{}", dduuid, onePamUUID);
+                apiTransactionLogDAO.logApiSuccess(
+                        dduuid,
+                        wrapper.getFileId(),
+                        COFACE_OPS_FLOW,
+                        RegkeyEnum.CREATE_POSTAL_ADDRESS.endpoint,
+                        RegkeyEnum.CREATE_POSTAL_ADDRESS.method,
+                        200
+                );
+            } else {
+                log.warn("Postal address response was null for UUID={}", dduuid);
+            }
+        } catch (Exception e) {
+            log.error("Postal address create failed for UUID={} : {}", dduuid, e.getMessage(), e);
+            apiTransactionLogDAO.logApiFailure(
+                    dduuid,
+                    wrapper.getFileId(),
+                    COFACE_OPS_FLOW,
+                    RegkeyEnum.CREATE_POSTAL_ADDRESS.endpoint,
+                    RegkeyEnum.CREATE_POSTAL_ADDRESS.method,
+                    "API_ERROR",
+                    e.getMessage()
+            );
+        }
+// ✅ CREATE DIGITAL ADDRESS (EMAIL + PHONE) after postal address and before hierarchy
+        try {
+            String email = wrapper.getDigitalAddrEmail();
+            String phone = wrapper.getDigitalAddrFullTel();
+
+            log.info("Checking digital addresses for dd_uuid:{} email='{}' phone='{}'",
+                    dduuid, email, phone);
+
+            // --- EMAIL: BSN_EMAIL ---
+            if (email != null && !email.isBlank()) {
+                log.info("Creating EMAIL digital address for onePamUuid:{} value:{}", onePamUUID, email);
+
+                CreateDigitalAddressV5Request reqEmail =
+                        digitalAddrService.buildCreateRequestForEmail(onePamUUID, email);
+
+                digitalAddrService.createDigitalAddr_OPS(dduuid, onePamUUID, reqEmail);
+                apiTransactionLogDAO.logApiSuccess(
+                        dduuid,
+                        wrapper.getFileId(),
+                        COFACE_OPS_FLOW,
+                        RegkeyEnum.CREATE_DIGITAL_ADDRESS.endpoint,
+                        RegkeyEnum.CREATE_DIGITAL_ADDRESS.method,
+                        200
+                );
+                orgUnitAccountingDAO.updateDigitalAddress_email(dduuid, wrapper.getDigitalAddrFullTel(), wrapper.getFileId());
+                log.info("EMAIL digital address created successfully for {}", onePamUUID);
+            }
+
+            // --- PHONE: BSN_TEL_NBR ---
+            if (phone != null && !phone.isBlank()) {
+                log.info("Creating PHONE digital address for onePamUuid:{} value:{}", onePamUUID, phone);
+
+                CreateDigitalAddressV5Request reqPhone =
+                        digitalAddrService.buildCreateRequestForPhone(onePamUUID, phone);
+
+                digitalAddrService.createDigitalAddr_OPS(dduuid, onePamUUID, reqPhone);
+
+                apiTransactionLogDAO.logApiSuccess(
+                        dduuid,
+                        wrapper.getFileId(),
+                        COFACE_OPS_FLOW,
+                        RegkeyEnum.CREATE_DIGITAL_ADDRESS.endpoint,
+                        RegkeyEnum.CREATE_DIGITAL_ADDRESS.method,
+                        200
+                );
+                orgUnitAccountingDAO.updateDigitalAddress_phone(dduuid, wrapper.getDigitalAddrFullTel(), wrapper.getFileId());
+
+                log.info("PHONE digital address created successfully for {}", onePamUUID);
+            }
+
+            // Nothing provided
+            if ((email == null || email.isBlank()) && (phone == null || phone.isBlank())) {
+                log.info("No digital address (email/phone) provided for onePamUuid:{}, skipping.", onePamUUID);
+            }
+
+        } catch (Exception e) {
+            log.error("Digital address creation failed for dd_uuid={} : {}", dduuid, e.getMessage(), e);
+
+            apiTransactionLogDAO.logApiFailure(
+                    dduuid,
+                    wrapper.getFileId(),
+                    COFACE_OPS_FLOW,
+                    RegkeyEnum.CREATE_DIGITAL_ADDRESS.endpoint,
+                    RegkeyEnum.CREATE_DIGITAL_ADDRESS.method,
+                    "API_ERROR",
+                    e.getMessage()
+            );
+        }
+            final String leNumber = wrapper.getOrgExternalIdentifierVal();
+            if (leNumber == null || leNumber.isBlank()) {
+                log.warn("LE number is null/blank in wrapper for opsUUID={}. Skipping hierarchy creation.", wrapper.getOpsUUID());
+            } else {
+                final String orgDdUuid = mappingDAO.findParentUUIDByExternalIdentifier(leNumber);
+                log.info("Resolved ORG DD_UUID '{}' for LE number '{}'", orgDdUuid, leNumber);
+
+                if (orgDdUuid == null || orgDdUuid.isBlank()) {
+                    log.warn("No DD_UUID found for LE/ORG_NUMBER='{}'. Skipping hierarchy.", leNumber);
+                } else {
+                    var orgSearch = involvedPartySearchService
+                            .searchInvolvedPartyByInternalIdentifier("organisation", "CSI_BE", orgDdUuid, wrapper.getFileId());
+
+                    if (orgSearch == null ||
+                            orgSearch.getOrganisations() == null ||
+                            orgSearch.getOrganisations().isEmpty()) {
+
+                        log.warn("No OnePAM organisation found for internal identifier [type=CSI_BE, value={}]. Skipping hierarchy.", orgDdUuid);
+
+                    } else {
+
+                        String parentId = orgSearch.getOrganisations().get(0).getInvolvedPartyIdentifier();
+
+                        if (parentId == null || parentId.isBlank()) {
+                            log.warn("Organisation found but missing involvedPartyIdentifier [CSI_BE={}].", orgDdUuid);
+                        } else {
+                            try {
+                                log.info("Calling Hierarchy-API for dd_uuid:{}, child:{}, parent:{}",
+                                        dduuid, onePamUUID, parentId);
+
+                                Response hierResp = createOrganisationUnitHierarchy(onePamUUID, parentId);
+
+                                apiTransactionLogDAO.logApiSuccess(
+                                        dduuid,
+                                        wrapper.getFileId(),
+                                        COFACE_OPS_FLOW,
+                                        RegkeyEnum.CREATE_ORGANISATION_UNIT_HIERARCHY.endpoint,
+                                        RegkeyEnum.CREATE_ORGANISATION_UNIT_HIERARCHY.method,
+                                        200
+                                );
+
+                                log.info("Hierarchy-API call success for dd_uuid:{}, child:{}, parent:{}",
+                                        dduuid, onePamUUID, parentId);
+
+                            } catch (Exception e) {
+                                log.error("Hierarchy create failed for UUID={} : {}", dduuid, e.getMessage(), e);
+
+                                apiTransactionLogDAO.logApiFailure(
+                                        dduuid,
+                                        wrapper.getFileId(),
+                                        COFACE_OPS_FLOW,
+                                        RegkeyEnum.CREATE_ORGANISATION_UNIT_HIERARCHY.endpoint,
+                                        RegkeyEnum.CREATE_ORGANISATION_UNIT_HIERARCHY.method,
+                                        "API_ERROR",
+                                        e.getMessage()
+                                );
+                            }
+                        }
+                    }
+                }
+
+
+            try {
+                apiTransactionLogDAO.updateNotificationStatusByUuid(dduuid, wrapper.getFileId());
+                log.info("Data_Distributor_Coface_OPS Updated notification status for dd_uuid:{} after organisation creation failure", dduuid);
+            } catch (Exception statusEx) {
+                log.error("Failed to update notification status for dd_uuid:{}, error:{}", dduuid, statusEx.getMessage());
+            }
+        }
+        log.info("Data_Distributor_Coface_OU update accounting/tracking Table completed...!");
+    }
+
+    private CreateInvolvedPartyResponseV5 createOrganisationUnit(String dd_uuid, OrganisationUnitDomainWrapper wrapper) {
+        String organisationUnitName = configReader.fetchOrganisationUnitName(dd_uuid);
+
+        Map<String, String> config = getConfig(dd_uuid);
+        CreateInvolvedPartyRequestV5 request = CreateInvolvedPartyRequestV5.builder()
+                .organisationUnit(
+                        CreateOrganisationUnitRequest.builder()
+                                .dataSource(DATA_SOURCE)
+                                .logicalDataDomain(LOGICAL_DATA_DOMAIN)
+                                .countryOfResidence(wrapper.getPostalAddressCntryCd())
+                                .preferredLanguage(PREFERRED_LANGUAGE)
+                                .channelOfEntry(CHANNEL_OF_ENTRY)
+                                .organisationUnitStructureType(STRUCTURE_TYPE)
+                                .effectiveDate("2025-09-02T00:30:11.537+02:00")
+                                .involvedPartyInternalIdentifiers(Collections.singletonList(
+                                        CreateInternalIdentifierRequest.builder()
+                                                .involvedPartyInternalIdentifierType("CSI_BE")
+                                                .involvedPartyInternalIdentifierValue(dd_uuid)
+                                                .build()))
+                                .organisationUnitNames(Collections.singletonList(
+                                        CreateOrganisationUnitNameRequest.builder()
+                                                .organisationUnitNameType(ORGANISATION_UNIT_NAME_TYPE)
+                                                .organisationUnitName(organisationUnitName)
+                                                .dataSource(DATA_SOURCE)
+                                                .build()))
+                                .build())
+                .build();
+        try {
+            log.info("Data_Distributor_Coface_OU Calling Create-OrganisationUnit-Api for dd_uuid:{}", dd_uuid);
+
+            CreateInvolvedPartyResponseV5 responseV5 = invPartyOnePamRepository.createInvolvedParty(request).get();
+
+            log.info("Data_Distributor_Coface_OU Create-OrganisationUnit-Api call Success for dd_uuid:{}", dd_uuid);
+            return responseV5;
+        } catch (Exception e) {
+            log.error("Failed to create organisation unit for uuid={}: {}", dd_uuid, e.getMessage(), e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    private UpdateExternalIdentifierInvolvedPartyRequest buildUpdateRequest(String uuid, OrganisationUnitDomainWrapper wrapper) {
+        Map<String, String> config = getConfig(uuid);
+        return UpdateExternalIdentifierInvolvedPartyRequest.builder()
+                .involvedPartyExternalIdentifierType(EXTERNAL_ID_TYPE_KBO)
+                .involvedPartyExternalIdentifierValue(config.get("opsNumber"))
+                .effectiveDate(OnePamDateUtil.toOnePamDate(wrapper.getOpsExtIdDateOfIssue()))
+                .dateOfIssue(wrapper.getOpsExtIdDateOfIssue())
+                .dataSource(DATA_SOURCE)
+                .build();
+    }
+
+    private Response createOrganisationUnitHierarchy(String childId, String parentId) {
+        OrganisationUnitOrganisationRelationshipRequest relationshipRequest =
+                OrganisationUnitOrganisationRelationshipRequest.builder()
+                        .childOrganisationUnitIdentifier(childId)
+                        .parentOrganisationIdentifier(parentId)
+                        .parentRoleReasonType("CPTL_CTRL")
+                        .dataSource(DATA_SOURCE)
+                        .build();
+
+        OrganisationUnitOrganisationRelationshipRequestV1 wrapper =
+                OrganisationUnitOrganisationRelationshipRequestV1.builder()
+                        .organisationUnitOrganisationRelationship(relationshipRequest)
+                        .build();
+
+        try {
+            Response response = organisationUnitOnePamRepository.createOrganisationUnitHierarchy(wrapper).get();
+            log.info("Successfully created hierarchy between child: {} and parent: {}", childId, parentId);
+
+            return response;
+        } catch (Exception e) {
+            log.error("Failed to create organisation unit hierarchy", e);
+            throw new RuntimeException("Hierarchy creation failed", e);
+        }
+    }
+
+    private Map<String, String> getConfig(String uuid) {
+        try {
+            List<Map<String, String>> list = configReader.fetchByOpsNumber(uuid);
+            return list.isEmpty() ? Collections.emptyMap() : list.get(0);
+        } catch (Exception e) {
+            e.printStackTrace();
+            throw e;
+        }
+    }
+}
