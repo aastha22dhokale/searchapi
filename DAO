@@ -1,0 +1,957 @@
+package com.ing.datadist.dao;
+
+import com.ing.datadist.dao.dbfields.Accounting.MappingDbFields;
+import com.ing.datadist.domain.MappingTableRecord;
+import com.ing.datadist.domain.OrganisationUnitDomainWrapper;
+import com.ing.datadist.kafka.util.NotificationStatus;
+import lombok.NonNull;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Repository
+@Slf4j
+public class MappingDAO {
+
+    private final static String MAPPING_TABLE_OPS_INSERT_SQL = "INSERT INTO DD_MAP_TBL (DD_UUID, OPS_NUMBER, TYP_OF_ENTY, CREATED_BY, CREATED_TS, FILE_ID) VALUES (?, ?, ?, 'DD_USER', SYSTIMESTAMP, ?)";
+    private final static String MAPPING_TABLE_LE_INSERT_SQL = "INSERT INTO DD_MAP_TBL (DD_UUID, ORG_NUMBER, TYP_OF_ENTY, CREATED_BY, CREATED_TS, FILE_ID) VALUES (?, ?, ?, 'DD_USER', SYSTIMESTAMP, ?)";
+    private final static int RS_MAPPING_TABLE_UUID_NO = 1;
+    private final static int RS_MAPPING_TABLE_OPS_NUMBER_NO = 2;
+    private final static int RS_MAPPING_TABLE_LE_NUMBER_NO = 2;
+    private final static int RS_MAPPING_TABLE_ENTY_TYPE_NO = 3;
+    private final static String MAPPING_TABLE_OPS_QUERYING_SQL_WITHOUT_PARAMETERS = "select DD_UUID, OPS_NUMBER FROM DD_MAP_TBL WHERE TYP_OF_ENTY=?";
+    private final static String MAPPING_TABLE_LE_QUERYING_SQL_WITHOUT_PARAMETERS = "select DD_UUID, ORG_NUMBER FROM DD_MAP_TBL  WHERE TYP_OF_ENTY=?";
+    private final static String MAPPING_TABLE_FIELD_OPS_NUMBER = "OPS_NUMBER";
+    private final static String MAPPING_TABLE_FIELD_DD_UUID = "DD_UUID";
+    private final static String MAPPING_TABLE_FIELD_ORG_NUMBER = "ORG_NUMBER";
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    public Map<String, String> fetchAllOPsUuidMappings() {
+
+        return jdbcTemplate.query(MAPPING_TABLE_OPS_QUERYING_SQL_WITHOUT_PARAMETERS, rs -> {
+            Map<String, String> result = new HashMap<>();
+            while (rs.next()) {
+                result.put(rs.getString(MAPPING_TABLE_FIELD_OPS_NUMBER), rs.getString(MAPPING_TABLE_FIELD_DD_UUID));
+            }
+            return result;
+        }, FlowType.OPS.getLabel());
+    }
+
+    public Map<String, String> fetchAllLEUuidMappings() {
+
+        return jdbcTemplate.query(MAPPING_TABLE_LE_QUERYING_SQL_WITHOUT_PARAMETERS, rs -> {
+            Map<String, String> result = new HashMap<>();
+            while (rs.next()) {
+                result.put(rs.getString(MAPPING_TABLE_FIELD_ORG_NUMBER), rs.getString(MAPPING_TABLE_FIELD_DD_UUID));
+            }
+            return result;
+        }, FlowType.LE.getLabel());
+    }
+
+    @Transactional
+    public void batchInsertOPsMappingRecords(List<OrganisationUnitDomainWrapper> records) {
+        log.info("batchInsertOPsMappingRecords: Starting batch insert for {} records", records.size());
+
+        if (records == null || records.isEmpty()) {
+            log.warn("batchInsertOPsMappingRecords: No records to insert");
+            return;
+        }
+
+        try {
+            int[] updateCounts = jdbcTemplate.batchUpdate(MAPPING_TABLE_OPS_INSERT_SQL, new BatchPreparedStatementSetter() {
+                public void setValues(@NonNull PreparedStatement ps, int i) throws SQLException {
+                    OrganisationUnitDomainWrapper record = records.get(i);
+                    log.debug("Inserting OPS record {}: DD_UUID={}, OPS_NUMBER={}, FILE_ID={}",
+                             i, record.getOpsUUID(), record.getOpsExternalIdentifierVal(), record.getFileId());
+
+                    ps.setString(RS_MAPPING_TABLE_UUID_NO, record.getOpsUUID());
+                    ps.setString(RS_MAPPING_TABLE_OPS_NUMBER_NO, record.getOpsExternalIdentifierVal());
+                    ps.setString(RS_MAPPING_TABLE_ENTY_TYPE_NO, FlowType.OPS.getLabel());
+                    ps.setString(4, record.getFileId()); // FILE_ID parameter
+                }
+
+                public int getBatchSize() {
+                    return records.size();
+                }
+            });
+
+            log.info("batchInsertOPsMappingRecords: Successfully inserted {} records", updateCounts.length);
+
+        } catch (Exception e) {
+            log.error("batchInsertOPsMappingRecords: Error occurred during batch insert", e);
+            throw new RuntimeException("Failed to insert OPS mapping records", e);
+        }
+    }
+
+    @Transactional
+    public void batchInsertLEMappingRecords(List<com.ing.datadist.domain.LegalEntityParentDomain> records) {
+        log.info("batchInsertLEMappingRecords: Starting batch insert for {} records", records.size());
+
+        if (records == null || records.isEmpty()) {
+            log.warn("batchInsertLEMappingRecords: No records to insert");
+            return;
+        }
+
+        try {
+            int[] updateCounts = jdbcTemplate.batchUpdate(MAPPING_TABLE_LE_INSERT_SQL, new BatchPreparedStatementSetter() {
+                public void setValues(@NonNull PreparedStatement ps, int i) throws SQLException {
+                    com.ing.datadist.domain.LegalEntityParentDomain record = records.get(i);
+                    log.debug("Inserting LE record {}: DD_UUID={}, ORG_NUMBER={}, FILE_ID={}",
+                             i, record.getOrgUUID(), record.getLeExternalIdentifier(), record.getFileId());
+
+                    ps.setString(RS_MAPPING_TABLE_UUID_NO, record.getOrgUUID());
+                    ps.setString(RS_MAPPING_TABLE_LE_NUMBER_NO, record.getLeExternalIdentifier());
+                    ps.setString(RS_MAPPING_TABLE_ENTY_TYPE_NO, FlowType.LE.getLabel());
+                    ps.setString(4, record.getFileId()); // FILE_ID parameter
+                }
+
+                public int getBatchSize() {
+                    return records.size();
+                }
+            });
+
+            log.info("batchInsertLEMappingRecords: Successfully inserted {} records", updateCounts.length);
+
+        } catch (Exception e) {
+            log.error("batchInsertLEMappingRecords: Error occurred during batch insert", e);
+            throw new RuntimeException("Failed to insert LE mapping records", e);
+        }
+    }
+
+    public void updateEventTrackStatus(String involvedPartyIdentifier, String notificationType, String transactionType, String status, String fileId) {
+        String updateSql = "UPDATE dd_event_track_tbl SET STATUS = ?, FILE_ID = ? WHERE DD_UUID = ? AND NOTIFICATION_TYPE = ? AND TRANSACTION_TYPE = ?";
+        jdbcTemplate.update(updateSql, status, fileId, involvedPartyIdentifier, notificationType, transactionType);
+    }
+
+    public void insertEventTrack(String involvedPartyIdentifier, String notificationType, String transactionType, String status, String fileId) {
+        String updateSql = "insert into dd_event_track_tbl(DD_UUID,NOTIFICATION_TYPE,TRANSACTION_TYPE,STATUS, FILE_ID) VALUES (?,?,?,?,?)";
+        jdbcTemplate.update(updateSql, involvedPartyIdentifier, notificationType, transactionType, status, fileId);
+    }
+
+    public List<String> findPendingNotifications(String uuid) {
+        String sql = """
+                    SELECT e.notification_type
+                    FROM DD_EVENT_TRACK_TBL e
+                    WHERE e.DD_UUID = ?
+                      AND e.status = ?
+                
+                """;
+        return jdbcTemplate.query(sql, (rs, i) -> rs.getString(1), uuid, NotificationStatus.EXPECTED.name());
+    }
+
+    public List<String> findPendingNotifications() {
+        String sql = """
+                    SELECT   e.notification_type
+                       FROM DD_EVENT_TRACK_TBL e
+                       WHERE e.status = ?
+                       ORDER BY e.DD_UUID
+                """;
+        return jdbcTemplate.query(sql, (rs, i) -> rs.getString(1), NotificationStatus.EXPECTED.name());
+    }
+
+    public boolean areAllNotificationsValidated(String ddUuid) {
+        String sql = """
+                    SELECT COUNT(*)
+                    FROM DD_EVENT_TRACK_TBL
+                    WHERE DD_UUID = ?
+                      AND STATUS <> ?
+                """;
+        Integer count = jdbcTemplate.queryForObject(sql, Integer.class, ddUuid, NotificationStatus.SYNCHRONIZED.name());
+        return count != null && count == 0;
+    }
+
+    public List<String> findUuidsMissingValidatedStatusAndNotInNotificationStatus() {
+        String sql = """
+                    SELECT DISTINCT e.DD_UUID
+                    FROM DD_EVENT_TRACK_TBL e
+                    WHERE e.STATUS <> ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM DD_NOTIFICATION_STATUS n
+                          WHERE n.DD_UUID = e.DD_UUID
+                      )
+                """;
+        return jdbcTemplate.query(sql, (rs, i) -> rs.getString(1), NotificationStatus.SYNCHRONIZED.name());
+    }
+
+    public List<String> findUuidsAllNotificationsValidatedAndNotInNotificationStatus() {
+        String sql = """
+                    SELECT DISTINCT e.DD_UUID
+                    FROM DD_EVENT_TRACK_TBL e
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM DD_EVENT_TRACK_TBL et
+                        WHERE et.DD_UUID = e.DD_UUID
+                          AND et.STATUS <> ?
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM DD_NOTIFICATION_STATUS n
+                        WHERE n.DD_UUID = e.DD_UUID
+                    )
+                """;
+        return jdbcTemplate.query(sql, (rs, i) -> rs.getString(1), NotificationStatus.SYNCHRONIZED.name());
+    }
+
+    public void insertFinalStatus(String UUID, String finalStatus, String fileId) {
+        String sql = """
+                    INSERT INTO DD_NOTIFICATION_STATUS
+                      (DD_UUID, STATUS, FILE_ID)
+                    VALUES (?, ?, ?)
+                """;
+        jdbcTemplate.update(sql, UUID, finalStatus, fileId);
+    }
+
+
+    public boolean eventTrackRecordExists(String ddUuid, String notificationType, String transactionType, String status) {
+        log.debug("Checking if event track record exists for ddUuid={}, notificationType={}, transactionType={}, status={}",
+                ddUuid, notificationType, transactionType, status);
+
+        String sql = "SELECT COUNT(*) FROM DD_EVENT_TRACK_TBL WHERE DD_UUID = ? AND NOTIFICATION_TYPE = ? AND TRANSACTION_TYPE=? AND STATUS IN ('RECEIVED', 'EXPECTED')";
+        Integer count = jdbcTemplate.queryForObject(sql, Integer.class, ddUuid, notificationType, transactionType);
+
+        log.debug("Event track record count={} for ddUuid={}, notificationType={}, transactionType={}",
+                count, ddUuid, notificationType, transactionType);
+
+        if (count == null || count == 0) {
+            log.info("No event track record found for ddUuid={}, notificationType={}, transactionType={}",
+                    ddUuid, notificationType, transactionType);
+            return false;
+        } else if (count == 1) {
+            log.info("Event track record exists for ddUuid={}, notificationType={}, transactionType={}",
+                    ddUuid, notificationType, transactionType);
+            return true;
+        } else {
+            log.error("Multiple event track records found (count={}) for ddUuid={}, notificationType={}, transactionType={}, status={}",
+                    count, ddUuid, notificationType, transactionType, status);
+            throw new IllegalStateException("Multiple records found for DD_UUID: " + ddUuid +
+                    ", NotificationType: " + notificationType + ", Status: " + status);
+        }
+    }
+
+    public void updateBulkStatus(List<String> uuids, String finalStatus, String fileId) {
+        String sql = "INSERT INTO DD_NOTIFICATION_STATUS (DD_UUID, STATUS, FILE_ID) VALUES (?, ?, ?)";
+        jdbcTemplate.batchUpdate(sql, uuids, uuids.size(), (ps, uuid) -> {
+            ps.setString(1, uuid);
+            ps.setString(2, finalStatus);
+            ps.setString(3, fileId);
+        });
+    }
+
+    public void updateBulkStatusSuccess(List<String> uuids, String fileId) {
+        String sql = "INSERT INTO DD_NOTIFICATION_STATUS (DD_UUID, STATUS, FILE_ID) VALUES (?, ?, ?)";
+        jdbcTemplate.batchUpdate(sql, uuids, uuids.size(), (ps, uuid) -> {
+            ps.setString(1, uuid);
+            ps.setString(2, "SUCCESS");
+            ps.setString(3, fileId);
+        });
+    }
+
+    public void updateBulkStatusFailure(List<String> uuids, String fileId) {
+        String sql = "INSERT INTO DD_NOTIFICATION_STATUS (DD_UUID, STATUS, FILE_ID) VALUES (?, ?, ?)";
+        jdbcTemplate.batchUpdate(sql, uuids, uuids.size(), (ps, uuid) -> {
+            ps.setString(1, uuid);
+            ps.setString(2, "FAILURE");
+            ps.setString(3, fileId);
+        });
+    }
+
+    public List<String> fetchUuidsWithExpectedStatusAndCreatedBefore24h() {
+        String sql = """
+                    SELECT DD_UUID
+                    FROM DD_EVENT_TRACK_TBL
+                    WHERE STATUS = ?
+                      AND CREATED_TS < (SYSTIMESTAMP - INTERVAL '24' HOUR)
+                """;
+        return jdbcTemplate.query(sql, (rs, i) -> rs.getString(1), NotificationStatus.EXPECTED.name());
+    }
+
+
+    public String findParentUUIDByExternalIdentifier(String leExternalIdentifier) {
+        String sql = "SELECT DD_UUID FROM DD_MAP_TBL WHERE ORG_NUMBER = ?";
+        try {
+            return jdbcTemplate.queryForObject(sql, new Object[]{leExternalIdentifier}, String.class);
+        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    public String findFlowTypeByUuid(String ddUuid) {
+        String sql = "SELECT TYP_OF_ENTY FROM DD_MAP_TBL WHERE DD_UUID = ?";
+        try {
+            return jdbcTemplate.queryForObject(sql, new Object[]{ddUuid}, String.class);
+        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+
+    public void batchInsertMappingRecords(List<MappingTableRecord> records) {
+        if (records.isEmpty()) {
+            log.info("batchInsertMappingRecords: No records to insert");
+            return;
+        }
+
+        log.info("batchInsertMappingRecords: Starting batch insert for {} records", records.size());
+
+        String sql = "INSERT INTO DD_MAP_TBL (" +
+                MappingDbFields.DD_UUID + ", " +
+                MappingDbFields.INCAPABLE_KEY + ", " +
+                MappingDbFields.TYP_OF_ENTY + ") " +
+                "VALUES (?, ?, ?)";
+
+        try {
+            jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(@NonNull PreparedStatement ps, int i) throws SQLException {
+                    MappingTableRecord record = records.get(i);
+
+                    ps.setString(1, record.getDdUuid());
+                    ps.setString(2, record.getCompositeKey());
+                    ps.setString(3, record.getTypeOfEntity());
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return records.size();
+                }
+            });
+
+            log.info("batchInsertMappingRecords: Successfully inserted {} records", records.size());
+        } catch (Exception e) {
+            log.error("batchInsertMappingRecords: Error during batch insert", e);
+            throw e;
+        }
+    }
+
+
+    public String findUuidByCompositeKey(String compositeKey) {
+        log.debug("findUuidByCompositeKey: compositeKey={}", compositeKey);
+
+        String sql = "SELECT " + MappingDbFields.DD_UUID +
+                " FROM DD_MAP_TBL WHERE " +
+                MappingDbFields.INCAPABLE_KEY + " = ? AND " +
+                MappingDbFields.TYP_OF_ENTY + " = ?";
+
+        try {
+            String uuid = jdbcTemplate.queryForObject(sql, new Object[]{compositeKey, FlowType.INCAPABLE.getLabel()}, String.class);
+            log.debug("findUuidByCompositeKey: Found UUID={} for composite key", uuid);
+            return uuid;
+        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+            log.debug("findUuidByCompositeKey: No record found for composite key");
+            return null;
+        }
+    }
+
+
+    public MappingTableRecord findIncapablesByCompositeKey(String compositeKey) {
+        log.debug("findIncapablesByCompositeKey: compositeKey={}", compositeKey);
+
+        String sql = "SELECT " + MappingDbFields.DD_UUID + ", " +
+                MappingDbFields.INCAPABLE_KEY + ", " +
+                MappingDbFields.TYP_OF_ENTY +
+                " FROM DD_MAP_TBL WHERE " +
+                MappingDbFields.INCAPABLE_KEY + " = ? AND " +
+                MappingDbFields.TYP_OF_ENTY + " = ?";
+
+        try {
+            return jdbcTemplate.queryForObject(sql,
+                    new Object[]{compositeKey, FlowType.INCAPABLE.getLabel()},
+                    (rs, rowNum) -> MappingTableRecord.builder()
+                            .ddUuid(rs.getString(MappingDbFields.DD_UUID))
+                            .compositeKey(rs.getString(MappingDbFields.INCAPABLE_KEY))
+                            .typeOfEntity(rs.getString(MappingDbFields.TYP_OF_ENTY))
+                            .build());
+        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+            log.debug("findIncapablesByCompositeKey: No record found for composite key");
+            return null;
+        }
+    }
+
+
+    public Map<String, String> fetchAllIncapableFlowUuidMappings() {
+        log.debug("fetchAllIncapableFlowUuidMappings: Fetching all incapable flow mappings");
+
+        String sql = "SELECT " + MappingDbFields.INCAPABLE_KEY + ", " +
+                MappingDbFields.DD_UUID +
+                " FROM DD_MAP_TBL WHERE " +
+                MappingDbFields.TYP_OF_ENTY + " = ?";
+
+        return jdbcTemplate.query(sql, rs -> {
+            Map<String, String> result = new HashMap<>();
+            while (rs.next()) {
+                String compositeKey = rs.getString(MappingDbFields.INCAPABLE_KEY);
+                String uuid = rs.getString(MappingDbFields.DD_UUID);
+                result.put(compositeKey, uuid);
+            }
+            log.debug("fetchAllIncapableFlowUuidMappings: Retrieved {} mappings", result.size());
+            return result;
+        }, FlowType.INCAPABLE.getLabel());
+    }
+}
+package com.ing.datadist.dao;
+
+import com.ing.datadist.dao.queries.LegalEntityQueries;
+import com.ing.datadist.domain.LegalEntityParentDomain;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+import static com.ing.datadist.dao.dbfields.DigitalAddressDbFields.*;
+import static com.ing.datadist.dao.dbfields.LegalEntityParentDbFields.*;
+import static com.ing.datadist.dao.dbfields.PostalAddressDbFields.*;
+
+@Repository
+@Slf4j
+public class LegalEntityParentDAO {
+
+    private final JdbcTemplate jdbcTemplate;
+
+    public LegalEntityParentDAO(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    public List<LegalEntityParentDomain> fetchRecordsByFileId(String fileId, int limit) {
+        log.info("Data_Distributor_Coface_LE: Fetching parent records for fileId={}, limit={}", fileId, limit);
+        List<LegalEntityParentDomain> records = jdbcTemplate.query(
+                LegalEntityQueries.FETCH_PARENT_RECORDS_BY_FILE_ID,
+                legalEntityParentDomainMapper(),
+                fileId,
+                limit);
+        log.info("Data_Distributor_Coface_LE: Fetched {} parent records for fileId={}", records.size(), fileId);
+        return records;
+    }
+
+    private RowMapper<LegalEntityParentDomain> legalEntityParentDomainMapper() {
+        return (rs, rowNum) -> {
+            LegalEntityParentDomain domain = new LegalEntityParentDomain();
+            domain.setOrgUUID(rs.getString(DD_UUID));
+            domain.setOrgStatus(rs.getString(ORG_STATUS));
+            domain.setOrgName(rs.getString(ORG_NAME));
+            domain.setOrgOtherName(rs.getString(ORG_OTHER_NAME));
+            domain.setOrgOtherNameType(rs.getString(ORG_OTHER_NAME_TYPE));
+            domain.setAdrUnstructuredAddress(rs.getString(UNSTRUCTURED_ADDRESS));
+            domain.setAdrPostalAddressStreetName(rs.getString(STREET_NAME));
+            domain.setAdrPostalAddressHouseNum(rs.getString(HOUSE_NUMBER));
+            domain.setAdrPostalAddressHouseNumAdd(rs.getString(HOUSE_ADDITION));
+            domain.setAdrPostalAddressPostalCode(rs.getString(POSTAL_CODE));
+            domain.setAdrPostalAddressCityName(rs.getString(CITY_NAME));
+            domain.setAdrPostalAddressCountryCode(rs.getString(COUNTRY_CODE));
+            domain.setOrgLegalForm(rs.getString(ORG_LEGAL_FORM));
+            domain.setOrgBusinessClosedownDate(rs.getString(ORG_BUSINESS_CLOSE_DOWN_DATE));
+            domain.setLELegalStatus(rs.getString(LE_LEGAL_STATUS));
+            domain.setOrgDateOfFoundation(rs.getString(ORG_DATE_OF_FOUNDATION));
+            domain.setLEPreferredLanguage(rs.getString(LE_PREFERRED_LANGUAGE));
+            domain.setAdrDigitalAddrFullTel(rs.getString(FULL_TEL));
+            domain.setNssoExternalIdentifier(rs.getString(NSSO_EXTL_IDENTIFIER));
+            domain.setAsmtVatStatus(rs.getString(ASMT_VAT_STATUS));
+            domain.setNssoExternalIdentifierStatus(rs.getString(NSSO_EXTL_IDENTIFIER_STATUS));
+            domain.setLeExternalIdentifier(rs.getString(EXTERNALIDENTIFIER_VAL));
+            domain.setFileId(rs.getString(FILE_ID));
+            return domain;
+        };
+    }
+}
+package com.ing.datadist.dao;
+
+import com.ing.datadist.dao.queries.LegalEntityQueries;
+import com.ing.datadist.domain.LegalEntityDeletionDomain;
+import lombok.NonNull;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.List;
+
+import static com.ing.datadist.dao.dbfields.LegalEntityDeletionDbFields.*;
+
+/**
+ * DAO class for Legal Entity Deletion database operations
+ */
+@Repository
+@Slf4j
+public class LegalEntityDeletionDAO {
+
+    private static final String INSERT_SQL =
+            "INSERT INTO DD_LEGALENTITY_DELETE_TBL (LE_EXTERNAL_IDENTIFIER, LE_DELETION_FLAG, DD_UUID, FILE_ID, " +
+                    "CREATED_BY, CREATED_TS) VALUES (?, ?, ?, ?, 'DD_USER', SYSTIMESTAMP)";
+
+    private static final String DELETE_BY_FILE_ID_SQL =
+            "DELETE FROM DD_LEGALENTITY_DELETE_TBL WHERE FILE_ID = ?";
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @Transactional
+    public void insertDeleteRecord(LegalEntityDeletionDomain record) {
+        log.info("LegalEntityDeletionDAO: Inserting deletion record for LE_EXTERNAL_IDENTIFIER: {}, DD_UUID: {}",
+                record.getLeExternalIdentifier(), record.getDdUuid());
+
+        try {
+            jdbcTemplate.update(INSERT_SQL,
+                    record.getLeExternalIdentifier(),
+                    record.getLeDeletionFlag(),
+                    record.getDdUuid(),
+                    record.getFileId());
+            log.info("LegalEntityDeletionDAO: Successfully inserted deletion record for LE_EXTERNAL_IDENTIFIER: {}",
+                    record.getLeExternalIdentifier());
+        } catch (Exception e) {
+            log.error("LegalEntityDeletionDAO: Error inserting deletion record for LE_EXTERNAL_IDENTIFIER: {}",
+                    record.getLeExternalIdentifier(), e);
+            throw new RuntimeException("Failed to insert LE deletion record", e);
+        }
+    }
+
+    @Transactional
+    public void batchInsertDeleteRecords(List<LegalEntityDeletionDomain> records) {
+        log.info("LegalEntityDeletionDAO: Starting batch insert for {} records", records.size());
+
+        if (records == null || records.isEmpty()) {
+            log.warn("LegalEntityDeletionDAO: No records to insert");
+            return;
+        }
+
+        try {
+            int[] updateCounts = jdbcTemplate.batchUpdate(INSERT_SQL, new BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(@NonNull PreparedStatement ps, int i) throws SQLException {
+                    LegalEntityDeletionDomain record = records.get(i);
+                    log.debug("Inserting LE deletion record {}: LE_EXTERNAL_IDENTIFIER={}, DD_UUID={}, FILE_ID={}",
+                            i, record.getLeExternalIdentifier(), record.getDdUuid(), record.getFileId());
+
+                    ps.setString(1, record.getLeExternalIdentifier());
+                    ps.setString(2, record.getLeDeletionFlag());
+                    ps.setString(3, record.getDdUuid());
+                    ps.setString(4, record.getFileId());
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return records.size();
+                }
+            });
+
+            log.info("LegalEntityDeletionDAO: Successfully inserted {} deletion records", updateCounts.length);
+
+        } catch (Exception e) {
+            log.error("LegalEntityDeletionDAO: Error occurred during batch insert", e);
+            throw new RuntimeException("Failed to insert LE deletion records", e);
+        }
+    }
+
+    @Transactional
+    public int deleteByFileId(String fileId) {
+        log.info("LegalEntityDeletionDAO: Deleting records for FILE_ID: {}", fileId);
+
+        try {
+            int deletedCount = jdbcTemplate.update(DELETE_BY_FILE_ID_SQL, fileId);
+            log.info("LegalEntityDeletionDAO: Deleted {} records for FILE_ID: {}", deletedCount, fileId);
+            return deletedCount;
+        } catch (Exception e) {
+            log.error("LegalEntityDeletionDAO: Error deleting records for FILE_ID: {}", fileId, e);
+            throw new RuntimeException("Failed to delete LE deletion records", e);
+        }
+    }
+
+
+    public List<LegalEntityDeletionDomain> fetchRecordsByFileId(String fileId, int limit) {
+        log.info("Data_Distributor_LE_Deletion: Fetching deletion records for fileId={}, limit={}", fileId, limit);
+        List<LegalEntityDeletionDomain> records = jdbcTemplate.query(
+                LegalEntityQueries.FETCH_DELETION_RECORDS_BY_FILE_ID,
+                legalEntityDeletionDomainMapper(),
+                fileId,
+                limit);
+        log.info("Data_Distributor_LE_Deletion: Fetched {} deletion records for fileId={}", records.size(), fileId);
+        return records;
+    }
+
+
+    private RowMapper<LegalEntityDeletionDomain> legalEntityDeletionDomainMapper() {
+        return (rs, rowNum) -> {
+            LegalEntityDeletionDomain domain = new LegalEntityDeletionDomain();
+            domain.setId(rs.getLong(ID));
+            domain.setLeExternalIdentifier(rs.getString(LE_EXTERNAL_IDENTIFIER));
+            domain.setLeDeletionFlag(rs.getString(LE_DELETION_FLAG));
+            domain.setDdUuid(rs.getString(DD_UUID));
+            domain.setFileId(rs.getString(FILE_ID));
+            return domain;
+        };
+    }
+}package com.ing.datadist.dao;
+
+import com.ing.datadist.dao.queries.LegalEntityQueries;
+import com.ing.datadist.domain.LegalEntityChildDomain;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+import static com.ing.datadist.dao.dbfields.LegalEntityChildDbFields.*;
+
+@Repository
+@Slf4j
+public class LegalEntityChildDAO {
+
+    private final JdbcTemplate jdbcTemplate;
+
+    public LegalEntityChildDAO(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    public List<LegalEntityChildDomain> fetchRecordsByFileId(String fileId, int limit) {
+        log.info("Data_Distributor_Coface_LE: Fetching child records for fileId={}, limit={}", fileId, limit);
+        List<LegalEntityChildDomain> records = jdbcTemplate.query(
+                LegalEntityQueries.FETCH_CHILD_RECORDS_BY_FILE_ID,
+                legalEntityChildDomainMapper(),
+                fileId,
+                limit);
+        log.info("Data_Distributor_Coface_LE: Fetched {} child records for fileId={}", records.size(), fileId);
+        return records;
+    }
+
+    public List<LegalEntityChildDomain> fetchRecordsByDdUuid(String ddUuid) {
+        log.info("Data_Distributor_Coface_LE: Fetching child records for ddUuid={}", ddUuid);
+        List<LegalEntityChildDomain> records = jdbcTemplate.query(
+                LegalEntityQueries.FETCH_CHILD_RECORDS_BY_DD_UUID,
+                legalEntityChildDomainMapper(),
+                ddUuid);
+        log.info("Data_Distributor_Coface_LE: Fetched {} child records for ddUuid={}", records.size(), ddUuid);
+        return records;
+    }
+
+    private RowMapper<LegalEntityChildDomain> legalEntityChildDomainMapper() {
+        return (rs, rowNum) -> {
+            LegalEntityChildDomain domain = new LegalEntityChildDomain();
+            domain.setOrgUUID(rs.getString(DD_UUID));
+            domain.setIndustryClassCode(rs.getString(INDUSTRY_CLASS_CODE));
+            
+            String rankStr = rs.getString(INDUSTRY_CLASS_CODE_RANK);
+            if (rankStr != null && !rankStr.isEmpty()) {
+                try {
+                    domain.setIndustryClassRank(Integer.parseInt(rankStr));
+                } catch (NumberFormatException e) {
+                    log.warn("Invalid industry class rank value: {}", rankStr);
+                    domain.setIndustryClassRank(null);
+                }
+            }
+            
+            domain.setIndustryClassEffDate(rs.getString(INDUSTRY_CLASS_EFF_DATE));
+            domain.setIndustryClassEndDate(rs.getString(INDUSTRY_CLASS_END_DATE));
+            domain.setFileId(rs.getString(FILE_ID));
+            return domain;
+        };
+    }
+}
+
+package com.ing.datadist.dao;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+import static com.ing.datadist.dao.dbfields.IncapablesDbFields.*;
+
+/**
+ * DAO for Incapables table operations.
+ * Handles fetch, update operations for DD_INCAPABLES_TBL.
+ */
+@Repository
+@Slf4j
+public class IncapablesDAO {
+
+    /**
+     * SQL for inserting incapable records via Spring Batch bean-mapped writer.
+     * Uses named parameters matching IncapableRelationship domain object properties.
+     */
+    public static final String INCAPABLES_TABLE_INSERT_SQL = "INSERT INTO DD_INCAPABLES_TBL (" +
+            DD_UUID + ", " + INCP_GENDER + ", " + INCP_LASTNAME + ", " + INCP_FIRSTNAME + ", " + INCP_STREETNAME + ", " +
+            INCP_HOUSENUMBER + ", " + INCP_HOUSENUMBERADDITION + ", " + INCP_POSTALCODE + ", " + INCP_CITYNAME + ", " +
+            INCP_COUNTRYOFRESIDENCE + ", " + INCP_DATEOFBIRTH + ", " + INCP_DATEOFDEATH + ", " + INCP_CITYOFBIRTH + ", " +
+            INCP_COUNTRYOFBIRTH + ", " + OBJECT_CODE + ", " + INAB_ENDDATE + ", " + INAB_EFFECTIVEDATE + ", " +
+            ADM_OCCUPATIONCODE + ", " + ADM_LASTNAME + ", " + ADM_FIRSTNAME + ", " + ADM_STREETNAME + ", " +
+            ADM_HOUSENUMBER + ", " + ADM_HOUSENUMBERADDITION + ", " + ADM_POSTALCODE + ", " + ADM_CITYNAME + ", " +
+            ADM_COUNTRYOFRESIDENCE + ", " + ADM_RESPONSIBILITY_ENDDATE + " , " + INC_ADM + " , " + FILE_ID +
+            ") VALUES (" +
+            // Root level property
+            ":ddUuid, " +
+            // IncapablePerson properties (direct + nested postalAddress)
+            ":incapablePerson.gender, :incapablePerson.lastName, :incapablePerson.firstName, " +
+            ":incapablePerson.postalAddress.streetName, :incapablePerson.postalAddress.houseNumber, " +
+            ":incapablePerson.postalAddress.houseNumberAddition, :incapablePerson.postalAddress.postalCode, " +
+            ":incapablePerson.postalAddress.cityName, :incapablePerson.postalAddress.countryOfResidence, " +
+            ":incapablePerson.dateOfBirth, :incapablePerson.dateOfDeath, :incapablePerson.cityOfBirth, " +
+            ":incapablePerson.countryOfBirth, " +
+            // Root level properties
+            ":objectCode, :inabilityEndDate, :inabilityEffectiveDate, " +
+            // Administrator properties (direct + nested postalAddress)
+            ":administrator.occupationCode, :administrator.lastName, :administrator.firstName, " +
+            ":administrator.postalAddress.streetName, :administrator.postalAddress.houseNumber, " +
+            ":administrator.postalAddress.houseNumberAddition, :administrator.postalAddress.postalCode, " +
+            ":administrator.postalAddress.cityName, :administrator.postalAddress.countryOfResidence, " +
+            ":administrator.responsibilityEndDate, " +
+            // File tracking
+            " :administratorDdUuid, :fileId" +
+            ")";
+
+    private final JdbcTemplate jdbcTemplate;
+
+    public IncapablesDAO(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    /**
+     * Fetch incapable records for API processing by fileId.
+     * Fetches all records from the table for the given file.
+     */
+    public List<IncapableDbRecord> fetchRecordsByFileId(String fileId, int limit) {
+        String sql = "SELECT DD_UUID, INCP_GENDER, INCP_LASTNAME, INCP_FIRSTNAME, " +
+                "INCP_STREETNAME, INCP_HOUSENUMBER, INCP_HOUSENUMBERADDITION, INCP_POSTALCODE, " +
+                "INCP_CITYNAME, INCP_COUNTRYOFRESIDENCE, INCP_DATEOFBIRTH, INCP_DATEOFDEATH, " +
+                "INCP_CITYOFBIRTH, INCP_COUNTRYOFBIRTH, OBJECT_CODE, INAB_ENDDATE, INAB_EFFECTIVEDATE, " +
+                "ADM_OCCUPATIONCODE, ADM_LASTNAME, ADM_FIRSTNAME, ADM_STREETNAME, ADM_HOUSENUMBER, " +
+                "ADM_HOUSENUMBERADDITION, ADM_POSTALCODE, ADM_CITYNAME, ADM_COUNTRYOFRESIDENCE, " +
+                "ADM_RESPONSIBILITY_ENDDATE, INC_ADM, FILE_ID " +
+                "FROM DD_INCAPABLES_TBL " +
+                "WHERE FILE_ID = ? " +
+                "AND ROWNUM <= ?";
+
+        log.info("Data_Distributor_Incapables: Fetching records for fileId={}, limit={}", fileId, limit);
+        List<IncapableDbRecord> records = jdbcTemplate.query(sql, incapableDbRecordMapper(), fileId, limit);
+        log.info("Data_Distributor_Incapables: Fetched {} records for fileId={}", records.size(), fileId);
+        return records;
+    }
+
+
+    /**
+     * Row mapper for IncapableDbRecord
+     */
+    private RowMapper<IncapableDbRecord> incapableDbRecordMapper() {
+        return (rs, rowNum) -> IncapableDbRecord.builder()
+                .ddUuid(rs.getString("DD_UUID"))
+                .incGender(rs.getString("INCP_GENDER"))
+                .incLastName(rs.getString("INCP_LASTNAME"))
+                .incFirstName(rs.getString("INCP_FIRSTNAME"))
+                .incStreetName(rs.getString("INCP_STREETNAME"))
+                .incHouseNumber(rs.getString("INCP_HOUSENUMBER"))
+                .incHouseNumberAddition(rs.getString("INCP_HOUSENUMBERADDITION"))
+                .incPostalCode(rs.getString("INCP_POSTALCODE"))
+                .incCityName(rs.getString("INCP_CITYNAME"))
+                .incCountryOfResidence(rs.getString("INCP_COUNTRYOFRESIDENCE"))
+                .incDateOfBirth(rs.getString("INCP_DATEOFBIRTH"))
+                .incDateOfDeath(rs.getString("INCP_DATEOFDEATH"))
+                .incCityOfBirth(rs.getString("INCP_CITYOFBIRTH"))
+                .incCountryOfBirth(rs.getString("INCP_COUNTRYOFBIRTH"))
+                .objectCode(rs.getString("OBJECT_CODE"))
+                .inabilityEndDate(rs.getString("INAB_ENDDATE"))
+                .inabilityEffectiveDate(rs.getString("INAB_EFFECTIVEDATE"))
+                .admOccupationCode(rs.getString("ADM_OCCUPATIONCODE"))
+                .admLastName(rs.getString("ADM_LASTNAME"))
+                .admFirstName(rs.getString("ADM_FIRSTNAME"))
+                .admStreetName(rs.getString("ADM_STREETNAME"))
+                .admHouseNumber(rs.getString("ADM_HOUSENUMBER"))
+                .admHouseNumberAddition(rs.getString("ADM_HOUSENUMBERADDITION"))
+                .admPostalCode(rs.getString("ADM_POSTALCODE"))
+                .admCityName(rs.getString("ADM_CITYNAME"))
+                .admCountryOfResidence(rs.getString("ADM_COUNTRYOFRESIDENCE"))
+                .admResponsibilityEndDate(rs.getString("ADM_RESPONSIBILITY_ENDDATE"))
+                .adminDdUuid(rs.getString("INC_ADM"))
+                .fileId(rs.getString("FILE_ID"))
+                .build();
+    }
+
+    /**
+     * Record class to hold incapable data from DB
+     */
+    @lombok.Builder
+    @lombok.Data
+    public static class IncapableDbRecord {
+        private String ddUuid;
+        private String incGender;
+        private String incLastName;
+        private String incFirstName;
+        private String incStreetName;
+        private String incHouseNumber;
+        private String incHouseNumberAddition;
+        private String incPostalCode;
+        private String incCityName;
+        private String incCountryOfResidence;
+        private String incDateOfBirth;
+        private String incDateOfDeath;
+        private String incCityOfBirth;
+        private String incCountryOfBirth;
+        private String objectCode;
+        private String inabilityEndDate;
+        private String inabilityEffectiveDate;
+        private String admOccupationCode;
+        private String admLastName;
+        private String admFirstName;
+        private String admStreetName;
+        private String admHouseNumber;
+        private String admHouseNumberAddition;
+        private String admPostalCode;
+        private String admCityName;
+        private String admCountryOfResidence;
+        private String admResponsibilityEndDate;
+        private String fileId;
+        private String adminDdUuid;
+    }
+}
+
+package com.ing.datadist.dao.queries;
+
+import com.ing.datadist.api.utils.DataDistributionConstants;
+import com.ing.datadist.dao.dbfields.Accounting.IndustryClassification;
+import com.ing.datadist.dao.dbfields.DigitalAddressDbFields;
+import com.ing.datadist.dao.dbfields.LegalEntityChildDbFields;
+import com.ing.datadist.dao.dbfields.LegalEntityDeletionDbFields;
+import com.ing.datadist.dao.dbfields.LegalEntityParentDbFields;
+import com.ing.datadist.dao.dbfields.PostalAddressDbFields;
+import com.ing.datadist.dao.dbfields.TableNames;
+
+public final class LegalEntityQueries {
+
+
+    public static final String FETCH_PARENT_RECORDS_BY_FILE_ID =
+            "SELECT " + LegalEntityParentDbFields.DD_UUID + ", " + 
+                    LegalEntityParentDbFields.ORG_STATUS + ", " + 
+                    LegalEntityParentDbFields.ORG_NAME + ", " + 
+                    LegalEntityParentDbFields.ORG_OTHER_NAME + ", " + 
+                    LegalEntityParentDbFields.ORG_OTHER_NAME_TYPE + ", " +
+                    PostalAddressDbFields.UNSTRUCTURED_ADDRESS + ", " + 
+                    PostalAddressDbFields.STREET_NAME + ", " + 
+                    PostalAddressDbFields.HOUSE_NUMBER + ", " +
+                    PostalAddressDbFields.HOUSE_ADDITION + ", " + 
+                    PostalAddressDbFields.POSTAL_CODE + ", " + 
+                    PostalAddressDbFields.CITY_NAME + ", " +
+                    PostalAddressDbFields.COUNTRY_CODE + ", " + 
+                    LegalEntityParentDbFields.ORG_LEGAL_FORM + ", " + 
+                    LegalEntityParentDbFields.ORG_BUSINESS_CLOSE_DOWN_DATE + ", " +
+                    LegalEntityParentDbFields.LE_LEGAL_STATUS + ", " + 
+                    LegalEntityParentDbFields.ORG_DATE_OF_FOUNDATION + ", " + 
+                    LegalEntityParentDbFields.LE_PREFERRED_LANGUAGE + ", " +
+                    DigitalAddressDbFields.FULL_TEL + ", " + 
+                    LegalEntityParentDbFields.NSSO_EXTL_IDENTIFIER + ", " +
+                    LegalEntityParentDbFields.ASMT_VAT_STATUS + ", " + 
+                    LegalEntityParentDbFields.NSSO_EXTL_IDENTIFIER_STATUS + ", " + 
+                    LegalEntityParentDbFields.EXTERNALIDENTIFIER_VAL + ", " + 
+                    LegalEntityParentDbFields.FILE_ID + " " +
+                    "FROM " + TableNames.DD_LEGAL_ENTITY_PARENT_TBL + " " +
+                    "WHERE " + LegalEntityParentDbFields.FILE_ID + " = ? " +
+                    "AND ROWNUM <= ?";
+
+
+    public static final String FETCH_CHILD_RECORDS_BY_FILE_ID =
+            "SELECT " + LegalEntityChildDbFields.DD_UUID + ", " + 
+                    LegalEntityChildDbFields.INDUSTRY_CLASS_CODE + ", " + 
+                    LegalEntityChildDbFields.INDUSTRY_CLASS_CODE_RANK + ", " +
+                    LegalEntityChildDbFields.INDUSTRY_CLASS_EFF_DATE + ", " + 
+                    LegalEntityChildDbFields.INDUSTRY_CLASS_END_DATE + ", " + 
+                    LegalEntityChildDbFields.FILE_ID + " " +
+                    "FROM " + TableNames.DD_LEGAL_ENTITY_CHILD_TBL + " " +
+                    "WHERE " + LegalEntityChildDbFields.FILE_ID + " = ? " +
+                    "AND ROWNUM <= ?";
+
+    public static final String FETCH_CHILD_RECORDS_BY_DD_UUID =
+            "SELECT " + LegalEntityChildDbFields.DD_UUID + ", " + 
+                    LegalEntityChildDbFields.INDUSTRY_CLASS_CODE + ", " + 
+                    LegalEntityChildDbFields.INDUSTRY_CLASS_CODE_RANK + ", " +
+                    LegalEntityChildDbFields.INDUSTRY_CLASS_EFF_DATE + ", " + 
+                    LegalEntityChildDbFields.INDUSTRY_CLASS_END_DATE + ", " + 
+                    LegalEntityChildDbFields.FILE_ID + " " +
+                    "FROM " + TableNames.DD_LEGAL_ENTITY_CHILD_TBL + " " +
+                    "WHERE " + LegalEntityChildDbFields.DD_UUID + " = ?";
+
+    public static final String FETCH_DELETION_RECORDS_BY_FILE_ID =
+            "SELECT " + LegalEntityDeletionDbFields.ID + ", " +
+                    LegalEntityDeletionDbFields.LE_EXTERNAL_IDENTIFIER + ", " +
+                    LegalEntityDeletionDbFields.LE_DELETION_FLAG + ", " +
+                    LegalEntityDeletionDbFields.DD_UUID + ", " +
+                    LegalEntityDeletionDbFields.FILE_ID + " " +
+                    "FROM " + TableNames.DD_LEGALENTITY_DELETE_TBL + " " +
+                    "WHERE " + LegalEntityDeletionDbFields.FILE_ID + " = ? " +
+                    "AND " + LegalEntityDeletionDbFields.LE_DELETION_FLAG + " = '" + DataDistributionConstants.DELETION_FLAG + "' " +
+                    "AND ROWNUM <= ?";
+
+    public static final String UPDATE_INDUSTRY_CLASSIFICATION_ONEPAM_FIELDS =
+            "UPDATE " + TableNames.DD_ORG_CHILD_ACCT_TBL + " SET " +
+                    IndustryClassification.INDUSTRY_CLASS_CODE_ONEPAM + " = ?, " +
+                    IndustryClassification.INDUSTRY_CLASS_RANK_ONEPAM + " = ?, " +
+                    IndustryClassification.INDUSTRY_CLASS_EFF_DATE_ONEPAM + " = ?, " +
+                    IndustryClassification.INDUSTRY_CLASS_END_DATE_ONEPAM + " = ?, " +
+                    "UPDATED_TS = ? " +
+                    "WHERE " + IndustryClassification.DD_UUID + " = ? " +
+                    "AND " + IndustryClassification.INDUSTRY_CLASS_CODE_DI + " = ?";
+
+    private LegalEntityQueries() {
+        // Private constructor to prevent instantiation
+    }
+}
+
+
+package com.ing.datadist.dao.queries;
+
+import com.ing.datadist.dao.dbfields.TableNames;
+
+import static com.ing.datadist.dao.dbfields.DigitalAddressDbFields.*;
+import static com.ing.datadist.dao.dbfields.OrganisationUnitDbFields.*;
+import static com.ing.datadist.dao.dbfields.PostalAddressDbFields.*;
+
+
+public final class OrganisationUnitQueries {
+
+    private static final String FILE_ID = "FILE_ID";
+
+    public static final String FETCH_RECORDS_BY_FILE_ID =
+            "SELECT " + OPS_UUID + ", " + OPS_NUMBER + ", " + ORG_UUID + ", " + ORG_NUMBER + ", " +
+                    OPS_ORGANISATIONUNITNAME + ", " + UNSTRUCTURED_ADDRESS + ", " +
+                    STREET_NAME + ", " + HOUSE_NUMBER + ", " +
+                    HOUSE_ADDITION + ", " + POSTAL_CODE + ", " +
+                    CITY_NAME + ", " + COUNTRY_CODE + ", " +
+                    OPS_EXTID_DATEOFISSUE + ", " + OPS_EXTID_EXPIRYDATE + ", " +
+                    FULL_TEL + ", " +
+                    EMAIL + ", " + FILE_ID + " " +
+                    "FROM " + TableNames.DD_COFACEOPS_TBL + " " +
+                    "WHERE " + FILE_ID + " = ? " +
+                    "AND ROWNUM <= ?";
+
+    public static final String INSERT_ORGANISATION_UNIT =
+            "INSERT INTO " + TableNames.DD_COFACEOPS_TBL + " (" +
+                    OPS_UUID + ", " + OPS_NUMBER + ", " + ORG_UUID + ", " + ORG_NUMBER + ", " +
+                    OPS_ORGANISATIONUNITNAME + ", " +
+                    UNSTRUCTURED_ADDRESS + ", " + STREET_NAME + ", " + HOUSE_NUMBER + ", " +
+                    HOUSE_ADDITION + ", " + POSTAL_CODE + ", " + CITY_NAME + ", " + COUNTRY_CODE + ", " +
+                    OPS_EXTID_DATEOFISSUE + ", " + OPS_EXTID_EXPIRYDATE + ", " +
+                    FULL_TEL +   ", " + EMAIL + ", " + FILE_ID + ") " +
+                    "VALUES (:opsUUID, :opsExternalIdentifierVal, :orgUUID, :orgExternalIdentifierVal, :organisationUnitName, " +
+                    ":address, :postalAddressStreetNm, :postalAddressHouseNum, :postalAddressHouseAdd, " +
+                    ":postalAddressPostalCd, :postalAddressCityName, :postalAddressCntryCd, " +
+                    ":opsExtIdDateOfIssue, :opsExtIdExpiryDate, " +
+                    ":digitalAddrFullTel, :digitalAddrEmail, " +
+                    ":fileId)";
+
+    private OrganisationUnitQueries() {
+        // Private constructor to prevent instantiation
+    }
+}
